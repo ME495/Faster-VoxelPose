@@ -62,10 +62,11 @@ class FasterVoxelPoseNet(nn.Module):
             resize_transform: 图像缩放变换矩阵
             
         Returns:
-            fused_poses: 融合后的3D关节位置
-            plane_poses: 三个正交平面上的关节投影
-            proposal_centers: 人体中心位置
-            input_heatmaps: 输入热图
+            fused_poses: 融合后的3D关节位置，形状为[batch_size, max_proposals, num_joints, 3]
+            plane_poses: 三个正交平面上的关节投影，形状为[3, batch_size, max_proposals, num_joints, 2]
+            proposal_centers: 人体中心位置，形状为[batch_size, max_proposals, 7]
+                其中7个值分别为：3D中心坐标 (x,y,z)、匹配的真实标注索引、置信度、边界框尺寸预测 (宽,高)
+            input_heatmaps: 输入热图，形状为[batch_size, num_views, num_joints, height, width]
             loss_dict: 损失字典（训练模式）
         """
         # 如果提供了RGB图像，使用backbone网络从图像生成热图

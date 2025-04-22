@@ -49,6 +49,15 @@ def train(config, backbone, model, optimizer, loader, epoch, output_dir, writer_
                                                                               input_heatmaps=input_heatmaps, 
                                                                               targets=targets, cameras=cameras, 
                                                                               resize_transform=resize_transform)
+        """
+        fused_poses: 融合后的3D关节位置，形状为[batch_size, max_proposals, num_joints, 3]
+        proposal_centers: 候选人体中心点信息，形状为[batch_size, max_proposals, 7]
+            其中7个值分别为：3D中心坐标 (x,y,z)、匹配的真实标注索引、置信度、边界框尺寸预测 (宽,高)
+            proposal_centers[:, :, 3] >= 0表示该提案匹配到了真实人体
+        plane_poses: 三个正交平面(xy, xz, yz)上的关节投影，形状为[3, batch_size, max_proposals, num_joints, 2]
+        input_heatmaps: 输入热图，形状为[batch_size, num_views, num_joints, height, width]
+        loss_dict: 损失字典（训练模式）
+        """
                 
         loss = loss_dict["total"]
         loss_2d = loss_dict["2d_heatmaps"]

@@ -90,7 +90,9 @@ class ProposalLayer(nn.Module):
             meta: 元数据
             
         Returns:
-            proposal_centers: 包含位置、置信度、匹配关系和边界框的完整候选框信息
+            proposal_centers: 包含位置、置信度、匹配关系和边界框的完整候选框信息，形状为[batch_size, max_people, 7]
+                其中7个值分别为：3D中心坐标 (x,y,z)、匹配的真实标注索引、置信度、边界框尺寸预测 (宽,高)
+                如果meta中包含root_3d和bbox，则使用真实标注过滤和匹配候选框，否则使用置信度阈值过滤候选框
         """
         device = topk_index.device
         batch_size = topk_index.shape[0]
@@ -163,10 +165,11 @@ class HumanDetectionNet(nn.Module):
             resize_transform: 图像缩放变换矩阵
             
         Returns:
-            proposal_heatmaps_2d: 2D候选热图
-            proposal_heatmaps_1d: 1D候选热图
-            proposal_centers: 候选人体中心点信息
-            bbox_preds: 边界框预测
+            proposal_heatmaps_2d: 2D候选热图，形状为[batch_size, 1, height, width]
+            proposal_heatmaps_1d: 1D候选热图，形状为[batch_size, max_people, depth]
+            proposal_centers: 候选人体中心点信息，形状为[batch_size, max_proposals, 7]
+                其中7个值分别为：3D中心坐标 (x,y,z)、匹配的真实标注索引、置信度、边界框尺寸预测 (宽,高)
+            bbox_preds: 过滤前边界框尺寸预测，形状为[batch_size, 2, height, width]
         """
         batch_size = heatmaps.shape[0]
         num_joints = heatmaps.shape[2]
