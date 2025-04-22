@@ -193,8 +193,8 @@ class Panoptic(JointsDataset):
             # convert the format of camera parameters
             for k, v in enumerate(cameras[seq]):
                 our_cam = dict()
-                our_cam['R'] = v['R']
-                our_cam['T'] = -np.dot(v['R'].T, v['t']) * 10.0  # the order to handle rotation and translation is reversed
+                our_cam['R'] = v['R'] # 世界坐标系到相机坐标系的旋转矩阵
+                our_cam['T'] = -np.dot(v['R'].T, v['t']) * 10.0  # 相机在世界坐标系中的位置(mm)
                 our_cam['fx'] = v['K'][0, 0]
                 our_cam['fy'] = v['K'][1, 1]
                 our_cam['cx'] = v['K'][0, 2]

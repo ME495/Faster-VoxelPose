@@ -146,6 +146,7 @@ cython_debug/
 data/Panoptic/*
 data/Shelf/*
 data/Campus/*
+data/Custom/*
 data/panoptic_training_pose.pkl
 backbone
 output

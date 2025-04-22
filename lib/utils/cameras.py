@@ -60,7 +60,7 @@ def project_point_cpu(x, R, T, f, c, k, p):
     Args
         x: Nx3 points in world coordinates
         R: 3x3 Camera rotation matrix
-        T: 3x1 Camera translation parameters
+        T: 3x1 Camera coordinates in world coordinates
         f: (scalar) Camera focal length
         c: 2x1 Camera center
         k: 3x1 Camera radial distortion coefficients
