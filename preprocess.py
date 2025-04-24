@@ -137,10 +137,11 @@ def preprocess_custom(image_size, trans):
     data_dir = 'data/Custom'
     
     # 读取自定义数据集中的序列列表
-    SEQ_LIST = ['Take_035', 'Take_036']  # 根据lib/dataset/custom.py中的配置
+    SEQ_LIST = ['Take_022', 'Take_023', 'Take_024']  # 根据lib/dataset/custom.py中的配置
 
     # 读取相机列表
-    cam_list = ['44310001', '44310002', '44310006', '44310010']  # 根据lib/dataset/custom.py中的配置
+    # cam_list = ['44310001', '44310002', '44310006', '44310010']  # 根据lib/dataset/custom.py中的配置
+    cam_list = ['44310029', '44310042', '44310043', '44310048']  # 根据lib/dataset/custom.py中的配置
     
     # 预处理每个序列
     for seq in SEQ_LIST:

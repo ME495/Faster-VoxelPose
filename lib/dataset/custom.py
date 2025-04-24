@@ -16,8 +16,13 @@ from dataset.JointsDataset import JointsDataset
 logger = logging.getLogger(__name__)
 
 VAL_LIST = [
-    'Take_035',
+    # 'Take_035',
     # 'Take_036'
+    # 'Take_019',
+    # 'Take_020',
+    # 'Take_022',
+    # 'Take_023',
+    'Take_024'
 ]
 
 custom_joints_def = {
@@ -55,7 +60,8 @@ class Custom(JointsDataset):
         
         self.has_evaluate_function = False
         self.transform = transform
-        self.cam_list = ['44310001', '44310002', '44310006', '44310010']
+        # self.cam_list = ['44310001', '44310002', '44310006', '44310010']
+        self.cam_list = ['44310029', '44310042', '44310043', '44310048']
         
         self.cameras = self._get_cam()
         self.db_file = '{}_meta.pkl'.format(self.image_set, self.num_views)

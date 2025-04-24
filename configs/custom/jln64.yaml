@@ -56,7 +56,7 @@ TRAIN:
 TEST:
   MODEL_FILE: 'model_best.pth.tar'
   BATCH_SIZE: 1
-  VISUALIZATION: false
+  VISUALIZATION: true
   VIS_TYPE: ['image_with_poses']
 
 CAPTURE_SPEC:
@@ -73,7 +73,7 @@ CAPTURE_SPEC:
     - 80
     - 20
   MAX_PEOPLE: 10
-  MIN_SCORE: 0.25
+  MIN_SCORE: 0.2
   
 INDIVIDUAL_SPEC:
   SPACE_SIZE:
