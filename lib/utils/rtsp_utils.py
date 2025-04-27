@@ -20,10 +20,16 @@ class RTSPReader:
         self.num_views = num_views    # 视图数量
         self.auto_split = auto_split  # 是否自动拆分多视角画面
     
-    def start(self):
-        """启动视频读取进程"""
+    def start(self, daemon=True):
+        """
+        启动视频读取进程
+        
+        Args:
+            daemon: 是否设置为守护进程
+        """
         self.process = Process(target=self.update, args=())
-        self.process.daemon = True
+        if daemon:
+            self.process.daemon = True
         self.process.start()
         return self
     
@@ -140,83 +146,6 @@ class RTSPReader:
     
     def stop(self):
         """停止读取进程"""
-        self.stopped = True
-        # 等待进程终止
-        if self.process is not None:
-            self.process.terminate()
-            self.process.join(timeout=1.0)
-            # 如果进程仍在运行，强制结束
-            if self.process.is_alive():
-                self.process.kill()
-
-
-class RTSPWriter:
-    """RTSP视频流写入器 - 多进程实现"""
-    def __init__(self, output_url, width, height, fps=30):
-        self.output_url = output_url
-        self.width = width
-        self.height = height
-        self.fps = fps
-        self.started = False
-        self.stopped = False
-        self.frame_queue = Queue(maxsize=10)
-        self.process = None
-        
-    def start(self):
-        """初始化RTSP输出流进程"""
-        if not self.output_url:
-            return self
-            
-        self.process = Process(target=self.update, args=())
-        self.process.daemon = True
-        self.process.start()
-        self.started = True
-        return self
-    
-    def update(self):
-        """处理并写入视频帧的进程"""
-        # 配置RTSP输出流，使用H.264编码
-        if hasattr(cv2, 'VideoWriter_fourcc'):
-            fourcc = cv2.VideoWriter_fourcc(*'H264')
-        else:
-            fourcc = cv2.cv.CV_FOURCC(*'H264')
-        
-        writer = cv2.VideoWriter(self.output_url, fourcc, self.fps, (self.width, self.height))
-        if not writer.isOpened():
-            print(f"警告: 无法初始化RTSP输出流，尝试使用XVID编码")
-            # 尝试使用XVID编码
-            if hasattr(cv2, 'VideoWriter_fourcc'):
-                fourcc = cv2.VideoWriter_fourcc(*'XVID')
-            else:
-                fourcc = cv2.cv.CV_FOURCC(*'XVID')
-            writer = cv2.VideoWriter(self.output_url, fourcc, self.fps, (self.width, self.height))
-            
-        # 持续写入帧
-        while not self.stopped:
-            if not self.frame_queue.empty():
-                frame = self.frame_queue.get()
-                if frame is not None:
-                    writer.write(frame)
-            else:
-                time.sleep(0.001)  # 避免CPU空转
-                
-        # 释放资源
-        writer.release()
-        
-    def write(self, frame):
-        """写入帧到队列"""
-        if self.started:
-            # 如果队列已满，移除最旧的帧
-            if self.frame_queue.full():
-                try:
-                    self.frame_queue.get_nowait()
-                except:
-                    pass
-            # 添加新帧到队列
-            self.frame_queue.put(frame)
-            
-    def stop(self):
-        """停止RTSP写入进程"""
         self.stopped = True
         # 等待进程终止
         if self.process is not None:

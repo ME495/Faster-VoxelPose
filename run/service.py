@@ -24,7 +24,7 @@ from core.config import config, update_config
 from utils.utils import create_logger
 from utils.transforms import get_affine_transform, get_scale
 from utils.vis import test_vis_all
-from utils.rtsp_utils import RTSPReader, RTSPWriter
+from utils.rtsp_utils import RTSPReader
 
 import models
 
@@ -505,12 +505,53 @@ def visualization_process(config, calibration_file, view_mode, output_url, view_
         stop_flag: 停止标志
     """
     # 初始化输出流（如果需要）
-    rtsp_writer = None
+    writer = None
     if view_mode == 'rtsp' and output_url:
+        # 检查输出URL是否有效
+        if not output_url.startswith("rtsp://"):
+            print(f"警告: 输出URL不是有效的RTSP地址: {output_url}，将改为保存到本地文件。")
+            output_url = "output.mp4"  # 默认保存到本地文件
+            
         image_size = np.array(config.DATASET.IMAGE_SIZE)
         output_width = image_size[0] * 2
         output_height = image_size[1] * 2
-        rtsp_writer = RTSPWriter(output_url, output_width, output_height).start()
+        
+        try:
+            # 尝试使用提供的本地文件路径或TCP/UDP端口
+            if output_url.startswith("rtsp://"):
+                # 使用管道将数据发送到ffmpeg，ffmpeg再通过RTSP提供流
+                cmd = [
+                    'ffmpeg',
+                    '-y',  # 覆盖现有文件
+                    '-f', 'rawvideo',
+                    '-vcodec', 'rawvideo',
+                    '-pix_fmt', 'bgr24',
+                    '-s', f'{output_width}x{output_height}',
+                    '-r', '30',  # 30fps
+                    '-i', '-',  # 从stdin读取
+                    '-c:v', 'libx264',
+                    '-pix_fmt', 'yuv420p',
+                    '-preset', 'ultrafast',
+                    '-f', 'rtsp',
+                    '-tune', 'zerolatency',
+                    '-rtsp_transport', 'tcp',
+                    output_url
+                ]
+                import subprocess
+                writer = subprocess.Popen(
+                    cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                )
+                print(f"成功创建RTSP流: {output_url}")
+            else:
+                # 使用普通的VideoWriter写入本地文件
+                fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+                writer = cv2.VideoWriter(output_url, fourcc, 30, (output_width, output_height))
+                if not writer.isOpened():
+                    print(f"警告: 无法初始化视频写入器: {output_url}")
+                    writer = None
+        except Exception as e:
+            print(f"初始化视频写入器时出错: {str(e)}")
+            writer = None
     
     # 可视化类型
     vis_types = view_type.split(',')
@@ -518,14 +559,29 @@ def visualization_process(config, calibration_file, view_mode, output_url, view_
     # 主循环
     print('=> 开始可视化处理')
     
+    # 存储上一帧的数据
+    last_result_data = None
+    
+    # 计算每帧间隔时间（30fps = 1/30秒）
+    frame_interval = 1.0 / 30.0  # 秒
+    
     while not stop_flag.value:
-        # 从队列获取结果
-        if result_queue.empty():
-            time.sleep(0.01)
-            continue
+        start_time = time.time()
         
-        result_data = result_queue.get()
+        # 尝试从队列获取结果
+        result_data = None
+        if not result_queue.empty():
+            result_data = result_queue.get()
+            if result_data is not None:
+                # 更新上一帧数据
+                last_result_data = result_data
+        elif last_result_data is not None:
+            # 如果队列为空但有上一帧数据，使用上一帧
+            result_data = last_result_data
+        
+        # 如果没有任何数据，等待一下再重试
         if result_data is None:
+            time.sleep(0.01)
             continue
             
         # 解包结果数据
@@ -591,12 +647,34 @@ def visualization_process(config, calibration_file, view_mode, output_url, view_
                     os.makedirs(output_dir, exist_ok=True)
                     timestamp = int(time.time() * 1000)
                     cv2.imwrite(os.path.join(output_dir, f'pose_{timestamp}.jpg'), vis_image)
-                elif view_mode == 'rtsp' and rtsp_writer is not None:
-                    rtsp_writer.write(vis_image)
+                elif view_mode == 'rtsp' and writer is not None:
+                    # 使用 FFmpeg 管道写入 RTSP 流
+                    if isinstance(writer, subprocess.Popen):
+                        try:
+                            writer.stdin.write(vis_image.tobytes())
+                        except BrokenPipeError:
+                            print("RTSP流连接断开，尝试重新连接...")
+                            # 可以在这里添加重新连接逻辑
+                    elif hasattr(writer, 'isOpened') and writer.isOpened():
+                        writer.write(vis_image)
+                    else:
+                        print("警告: 无法写入视频流")
+        
+        # 计算已经消耗的时间，并等待剩余时间以保持30fps
+        elapsed_time = time.time() - start_time
+        remaining_time = frame_interval - elapsed_time
+        if remaining_time > 0:
+            time.sleep(remaining_time)
     
     # 清理资源
-    if rtsp_writer is not None:
-        rtsp_writer.stop()
+    if writer is not None:
+        if isinstance(writer, subprocess.Popen):
+            writer.stdin.close()
+            writer.wait(timeout=1)
+            if writer.poll() is None:
+                writer.terminate()
+        else:
+            writer.release()
     if view_mode == 'show':
         cv2.destroyAllWindows()
     
@@ -622,12 +700,14 @@ def main():
     frame_queue = Queue(maxsize=1)  # 帧队列
     result_queue = Queue(maxsize=5)  # 结果队列
     
-    # 初始化视频流读取器 - 现在支持自动拆分帧
+    # 初始化视频流读取器，不使用daemon进程
     image_size = np.array(config.DATASET.IMAGE_SIZE)
-    rtsp_reader = RTSPReader(args.rtsp_url, image_size=image_size, num_views=config.DATASET.CAMERA_NUM, auto_split=True).start()
+    rtsp_reader = RTSPReader(args.rtsp_url, image_size=image_size, num_views=config.DATASET.CAMERA_NUM, auto_split=True)
+    # 启动进程但不设置daemon
+    rtsp_reader.start(daemon=False)
     time.sleep(1.0)  # 等待视频流初始化
     
-    # 开启推理进程
+    # 开启推理进程，不设置daemon
     model_file = os.path.join(final_output_dir, config.TEST.MODEL_FILE)
     inference_proc = Process(
         target=inference_process,
@@ -642,10 +722,10 @@ def main():
             stop_flag
         )
     )
-    inference_proc.daemon = True
+    # 移除daemon=True设置
     inference_proc.start()
     
-    # 开启可视化进程
+    # 开启可视化进程，不设置daemon
     visualization_proc = Process(
         target=visualization_process,
         args=(
@@ -660,7 +740,7 @@ def main():
             stop_flag
         )
     )
-    visualization_proc.daemon = True
+    # 移除daemon=True设置
     visualization_proc.start()
     
     # 主进程负责读取视频帧并放入队列
@@ -687,11 +767,11 @@ def main():
             # 放入帧队列
             frame_queue.put(frame)
             
-            # 定期输出状态
-            with fps_value.get_lock():
-                current_fps = fps_value.value
-            if current_fps > 0:
-                logger.info(f'FPS: {current_fps:.1f}')
+            # # 定期输出状态
+            # with fps_value.get_lock():
+            #     current_fps = fps_value.value
+            # if current_fps > 0:
+            #     logger.info(f'FPS: {current_fps:.1f}')
                 
             time.sleep(0.001)  # 避免CPU空转
     
