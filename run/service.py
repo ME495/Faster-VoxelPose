@@ -16,6 +16,8 @@ import time
 import cv2
 import numpy as np
 import json
+import multiprocessing as mp
+from multiprocessing import Process, Queue, Value, Array
 
 import _init_paths
 from core.config import config, update_config
@@ -330,13 +332,23 @@ def setup_cameras(calibration_file=None, num_views=4):
         raise FileNotFoundError(f"错误：未提供相机标定文件或文件不存在！请使用--calibration_file参数指定有效的标定文件。")
 
 
-def main():
-    args = parse_args()
-    logger, final_output_dir, _ = create_logger(config, args.cfg, 'service')
-    logger.info(f'启动RTSP姿态估计服务 - 输入流: {args.rtsp_url}')
-
-    # 设置设备
-    logger.info(f'使用设备: {config.DEVICE}')
+def inference_process(config, model_file, calibration_file, rtsp_url, fps_value, frame_queue, result_queue, stop_flag):
+    """
+    执行模型推理的进程
+    
+    Args:
+        model_file: 模型文件路径
+        calibration_file: 标定文件路径
+        rtsp_url: RTSP视频流URL
+        fps_value: 共享的FPS值
+        frame_queue: 帧队列
+        result_queue: 结果队列
+        stop_flag: 停止标志
+    """
+    # 设置CUDA相关配置
+    cudnn.benchmark = config.CUDNN.BENCHMARK
+    torch.backends.cudnn.deterministic = config.CUDNN.DETERMINISTIC
+    torch.backends.cudnn.enabled = config.CUDNN.ENABLED
     
     # 准备输入数据处理
     normalize = transforms.Normalize(
@@ -347,20 +359,15 @@ def main():
         normalize,
     ])
     
-    # 设置CUDA相关配置
-    cudnn.benchmark = config.CUDNN.BENCHMARK
-    torch.backends.cudnn.deterministic = config.CUDNN.DETERMINISTIC
-    torch.backends.cudnn.enabled = config.CUDNN.ENABLED
-    
     # 构建模型
-    logger.info('=> 构建模型...')
+    print('=> 构建模型...')
     model = eval('models.' + config.MODEL + '.get')(config)
     model = model.to(config.DEVICE)
     
     # 加载特征提取网络
     if config.NETWORK.PRETRAINED_BACKBONE:
         backbone = eval('models.' + config.BACKBONE + '.get')(config)
-        logger.info('=> 加载预训练特征提取网络权重')
+        print('=> 加载预训练特征提取网络权重')
         backbone.load_state_dict(torch.load(config.NETWORK.PRETRAINED_BACKBONE))
         backbone = backbone.to(config.DEVICE)
         backbone.eval()
@@ -368,12 +375,11 @@ def main():
         backbone = None
     
     # 加载模型权重
-    model_file = os.path.join(final_output_dir, config.TEST.MODEL_FILE)
-    if config.TEST.MODEL_FILE and os.path.isfile(model_file):
-        logger.info(f'=> 加载模型权重 {model_file}')
+    if os.path.isfile(model_file):
+        print(f'=> 加载模型权重 {model_file}')
         model.load_state_dict(torch.load(model_file))
     else:
-        logger.error('模型文件不存在！')
+        print('模型文件不存在！')
         return
     
     # 设置为评估模式
@@ -381,11 +387,11 @@ def main():
     
     # 设置相机参数
     try:
-        cameras = setup_cameras(calibration_file=args.calibration_file, num_views=config.DATASET.CAMERA_NUM)
-        logger.info(f'=> 成功加载相机参数，相机数量: {len(cameras["default"])}')
+        cameras = setup_cameras(calibration_file=calibration_file, num_views=config.DATASET.CAMERA_NUM)
+        print(f'=> 成功加载相机参数，相机数量: {len(cameras["default"])}')
     except Exception as e:
-        logger.error(str(e))
-        logger.error('程序无法继续，退出中...')
+        print(str(e))
+        print('程序无法继续，退出中...')
         return
     
     # 计算缩放变换矩阵
@@ -397,130 +403,309 @@ def main():
     trans = get_affine_transform(c, s, r, image_size)
     resize_transform = torch.as_tensor(trans, dtype=torch.float, device=config.DEVICE)
     
+    # 统计FPS
+    fps_time = time.time()
+    fps_count = 0
+    
+    # 主循环
+    print('=> 开始处理视频流')
+    frame_count = 0
+    skipped_count = 0
+    
+    while not stop_flag.value:
+        # 从队列获取帧
+        if frame_queue.empty():
+            time.sleep(0.01)
+            continue
+        
+        frame = frame_queue.get()
+        if frame is None:
+            continue
+            
+        frame_count += 1
+        
+        # 将单个帧拆分为多个视图
+        views, is_valid = split_frame(frame, image_size, config.DATASET.CAMERA_NUM)
+        
+        # 检查图像尺寸是否符合要求
+        if not is_valid:
+            skipped_count += 1
+            continue
+        
+        # 记录起始时间
+        start_time = time.time()
+        
+        # 准备输入数据
+        inputs = prepare_input(views, transform)
+        inputs = inputs.to(config.DEVICE)
+        
+        # 创建元数据
+        meta = {'seq': ['default']}
+        
+        # 前向推理
+        with torch.no_grad():
+            fused_poses, plane_poses, proposal_centers, input_heatmaps, _ = model(
+                backbone=backbone, 
+                views=inputs, 
+                meta=meta, 
+                cameras=cameras, 
+                resize_transform=resize_transform
+            )
+        
+        # 计算推理时间
+        inference_time = time.time() - start_time
+        
+        # 计算FPS
+        fps_count += 1
+        if fps_count >= 10:
+            with fps_value.get_lock():
+                fps_value.value = fps_count / (time.time() - fps_time)
+            fps_time = time.time()
+            fps_count = 0
+            
+        # 将结果放入结果队列
+        result_data = {
+            'views': views,
+            'meta': meta,
+            'fused_poses': fused_poses.cpu().numpy(),
+            'input_heatmaps': input_heatmaps.cpu().numpy(),
+            'inference_time': inference_time
+        }
+        
+        # 如果队列已满，移除最旧的结果
+        if result_queue.full():
+            try:
+                result_queue.get_nowait()
+            except:
+                pass
+                
+        result_queue.put(result_data)
+    
+    print('推理进程结束')
+
+
+def visualization_process(config, calibration_file, view_mode, output_url, view_type, output_dir, fps_value, result_queue, stop_flag):
+    """
+    处理可视化的进程
+    
+    Args:
+        view_mode: 可视化模式
+        output_url: 输出RTSP流URL
+        view_type: 可视化类型
+        output_dir: 输出目录
+        fps_value: 共享的FPS值
+        result_queue: 结果队列
+        stop_flag: 停止标志
+    """
+    # 初始化输出流（如果需要）
+    rtsp_writer = None
+    if view_mode == 'rtsp' and output_url:
+        image_size = np.array(config.DATASET.IMAGE_SIZE)
+        output_width = image_size[0] * 2
+        output_height = image_size[1] * 2
+        rtsp_writer = RTSPWriter(output_url, output_width, output_height).start()
+    
+    # 可视化类型
+    vis_types = view_type.split(',')
+    
+    # 主循环
+    print('=> 开始可视化处理')
+    
+    while not stop_flag.value:
+        # 从队列获取结果
+        if result_queue.empty():
+            time.sleep(0.01)
+            continue
+        
+        result_data = result_queue.get()
+        if result_data is None:
+            continue
+            
+        # 解包结果数据
+        views = result_data['views']
+        meta = result_data['meta']
+        fused_poses = torch.from_numpy(result_data['fused_poses'])
+        input_heatmaps = torch.from_numpy(result_data['input_heatmaps'])
+        inference_time = result_data['inference_time']
+        
+        # 处理结果可视化
+        if view_mode != 'none':
+            # 构建可视化图像
+            if 'image_with_poses' in vis_types:
+                # 获取图像尺寸
+                image_size = np.array(config.DATASET.IMAGE_SIZE)
+                
+                # 合并四个视图并在其上绘制结果
+                vis_image = np.zeros((image_size[1] * 2, image_size[0] * 2, 3), dtype=np.uint8)
+                
+                # 将拆分的视图放回原位
+                for i, view in enumerate(views):
+                    if view.shape[0] != image_size[1] or view.shape[1] != image_size[0]:
+                        view = cv2.resize(view, (image_size[0], image_size[1]))
+                    
+                    row = i // 2
+                    col = i % 2
+                    y_start = row * image_size[1]
+                    x_start = col * image_size[0]
+                    vis_image[y_start:y_start+image_size[1], x_start:x_start+image_size[0]] = view
+                
+                # 计算缩放变换矩阵
+                ori_image_size = np.array(config.DATASET.ORI_IMAGE_SIZE)
+                c = np.array([ori_image_size[0] / 2.0, ori_image_size[1] / 2.0])
+                s = get_scale(ori_image_size, image_size)
+                r = 0
+                trans = get_affine_transform(c, s, r, image_size)
+                resize_transform = torch.as_tensor(trans, dtype=torch.float)
+                
+                # 创建相机参数对象
+                cameras = None
+                try:
+                    cameras = setup_cameras(calibration_file=calibration_file, num_views=config.DATASET.CAMERA_NUM)
+                except Exception as e:
+                    print(f"可视化进程无法加载相机参数: {str(e)}")
+                    continue
+                
+                # 在图像上渲染3D姿态结果
+                vis_image = render_result_on_image(config, meta, cameras, resize_transform, vis_image, input_heatmaps, fused_poses)
+                
+                # 添加FPS信息
+                with fps_value.get_lock():
+                    fps = fps_value.value
+                cv2.putText(vis_image, f"FPS: {fps:.1f}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+                cv2.putText(vis_image, f"Inference time: {inference_time*1000:.1f}ms", (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+                
+                # 根据可视化模式处理
+                if view_mode == 'show':
+                    cv2.imshow('3D Pose Estimation', vis_image)
+                    if cv2.waitKey(1) & 0xFF == ord('q'):
+                        stop_flag.value = 1
+                        break
+                elif view_mode == 'save':
+                    os.makedirs(output_dir, exist_ok=True)
+                    timestamp = int(time.time() * 1000)
+                    cv2.imwrite(os.path.join(output_dir, f'pose_{timestamp}.jpg'), vis_image)
+                elif view_mode == 'rtsp' and rtsp_writer is not None:
+                    rtsp_writer.write(vis_image)
+    
+    # 清理资源
+    if rtsp_writer is not None:
+        rtsp_writer.stop()
+    if view_mode == 'show':
+        cv2.destroyAllWindows()
+    
+    print('可视化进程结束')
+
+
+def main():
+    args = parse_args()
+    logger, final_output_dir, _ = create_logger(config, args.cfg, 'service')
+    logger.info(f'启动RTSP姿态估计服务 - 输入流: {args.rtsp_url}')
+
+    # 设置设备
+    logger.info(f'使用设备: {config.DEVICE}')
+    
+    # 初始化多进程环境
+    mp.set_start_method('spawn', force=True)
+    
+    # 创建共享变量
+    stop_flag = Value('i', 0)  # 停止标志
+    fps_value = Value('d', 0.0)  # FPS值
+    
+    # 创建进程间通信队列
+    frame_queue = Queue(maxsize=10)  # 帧队列
+    result_queue = Queue(maxsize=5)  # 结果队列
+    
     # 初始化视频流读取器
     rtsp_reader = RTSPReader(args.rtsp_url).start()
     time.sleep(1.0)  # 等待视频流初始化
     
-    # 初始化输出流（如果需要）
-    rtsp_writer = None
-    if args.view_mode == 'rtsp' and args.output_url:
-        output_width = image_size[0] * 2
-        output_height = image_size[1] * 2
-        rtsp_writer = RTSPWriter(args.output_url, output_width, output_height).start()
+    # 开启推理进程
+    model_file = os.path.join(final_output_dir, config.TEST.MODEL_FILE)
+    inference_proc = Process(
+        target=inference_process,
+        args=(
+            config,
+            model_file,
+            args.calibration_file,
+            args.rtsp_url,
+            fps_value,
+            frame_queue,
+            result_queue,
+            stop_flag
+        )
+    )
+    inference_proc.daemon = True
+    inference_proc.start()
     
-    # 可视化类型
-    vis_types = args.view_type.split(',')
+    # 开启可视化进程
+    visualization_proc = Process(
+        target=visualization_process,
+        args=(
+            config,
+            args.calibration_file,
+            args.view_mode,
+            args.output_url,
+            args.view_type,
+            args.output_dir,
+            fps_value,
+            result_queue,
+            stop_flag
+        )
+    )
+    visualization_proc.daemon = True
+    visualization_proc.start()
     
-    # 统计FPS
-    fps_time = time.time()
-    fps_count = 0
-    fps = 0
-    
-    # 主循环
-    logger.info('=> 开始处理视频流')
-    frame_count = 0
-    skipped_count = 0
-    
+    # 主进程负责读取视频帧并放入队列
     try:
         while True:
+            # 检查子进程是否正常运行
+            if not inference_proc.is_alive() or not visualization_proc.is_alive():
+                logger.error("子进程意外终止，正在退出...")
+                break
+                
             # 读取一帧
             frame = rtsp_reader.read()
             if frame is None:
                 time.sleep(0.01)
                 continue
             
-            frame_count += 1
-            
-            # 将单个帧拆分为多个视图
-            views, is_valid = split_frame(frame, image_size, config.DATASET.CAMERA_NUM)
-            
-            # 检查图像尺寸是否符合要求
-            if not is_valid:
-                skipped_count += 1
-                logger.warning(f"警告: 接收到的图像尺寸与配置不匹配，已跳过。当前帧: {frame_count}, 已跳过: {skipped_count}")
-                continue
-            
-            # 记录起始时间
-            start_time = time.time()
-            
-            # 准备输入数据
-            inputs = prepare_input(views, transform)
-            inputs = inputs.to(config.DEVICE)
-            
-            # 创建元数据
-            meta = {'seq': ['default']}
-            
-            # 前向推理
-            with torch.no_grad():
-                fused_poses, plane_poses, proposal_centers, input_heatmaps, _ = model(
-                    backbone=backbone, 
-                    views=inputs, 
-                    meta=meta, 
-                    cameras=cameras, 
-                    resize_transform=resize_transform
-                )
-            
-            # 计算推理时间
-            inference_time = time.time() - start_time
-            
-            # 计算FPS
-            fps_count += 1
-            if fps_count >= 10:
-                fps = fps_count / (time.time() - fps_time)
-                fps_time = time.time()
-                fps_count = 0
-            
-            # 处理结果可视化
-            if args.view_mode != 'none':
-                # 构建可视化图像
-                if 'image_with_poses' in vis_types:
-                    # 合并四个视图并在其上绘制结果
-                    vis_image = np.zeros((image_size[1] * 2, image_size[0] * 2, 3), dtype=np.uint8)
+            # 如果队列已满，移除最旧的帧以避免延迟
+            if frame_queue.full():
+                try:
+                    frame_queue.get_nowait()
+                except:
+                    pass
                     
-                    # 将拆分的视图放回原位
-                    for i, view in enumerate(views):
-                        if view.shape[0] != image_size[1] or view.shape[1] != image_size[0]:
-                            view = cv2.resize(view, (image_size[0], image_size[1]))
-                        
-                        row = i // 2
-                        col = i % 2
-                        y_start = row * image_size[1]
-                        x_start = col * image_size[0]
-                        vis_image[y_start:y_start+image_size[1], x_start:x_start+image_size[0]] = view
-                    
-                    # 在图像上渲染3D姿态结果
-                    vis_image = render_result_on_image(config, meta, cameras, resize_transform, vis_image, input_heatmaps, fused_poses)
-                    
-                    # 添加FPS信息
-                    cv2.putText(vis_image, f"FPS: {fps:.1f}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-                    cv2.putText(vis_image, f"Inference time: {inference_time*1000:.1f}ms", (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-                    
-                    # 根据可视化模式处理
-                    if args.view_mode == 'show':
-                        cv2.imshow('3D Pose Estimation', vis_image)
-                        if cv2.waitKey(1) & 0xFF == ord('q'):
-                            break
-                    elif args.view_mode == 'save':
-                        os.makedirs(args.output_dir, exist_ok=True)
-                        timestamp = int(time.time() * 1000)
-                        cv2.imwrite(os.path.join(args.output_dir, f'pose_{timestamp}.jpg'), vis_image)
-                    elif args.view_mode == 'rtsp' and rtsp_writer is not None:
-                        rtsp_writer.write(vis_image)
+            # 放入帧队列
+            frame_queue.put(frame)
             
-            # 输出当前状态信息
-            if fps_count == 0:
-                logger.info(f'FPS: {fps:.1f}, 推理时间: {inference_time*1000:.1f}ms')
+            # 定期输出状态
+            with fps_value.get_lock():
+                current_fps = fps_value.value
+            if current_fps > 0:
+                logger.info(f'FPS: {current_fps:.1f}')
+                
+            time.sleep(0.001)  # 避免CPU空转
     
     except KeyboardInterrupt:
         logger.info('服务被用户中断')
     finally:
+        # 设置停止标志
+        stop_flag.value = 1
+        
         # 清理资源
         logger.info('正在清理资源...')
         rtsp_reader.stop()
-        if rtsp_writer is not None:
-            rtsp_writer.stop()
-        if args.view_mode == 'show':
-            cv2.destroyAllWindows()
+        
+        # 等待子进程结束
+        inference_proc.join(timeout=3.0)
+        visualization_proc.join(timeout=3.0)
+        
+        # 如果进程未能正常退出，强制结束
+        if inference_proc.is_alive():
+            inference_proc.terminate()
+        if visualization_proc.is_alive():
+            visualization_proc.terminate()
 
 
 if __name__ == "__main__":
