@@ -531,9 +531,15 @@ def visualization_process(config, calibration_file, view_mode, output_url, view_
                     '-i', '-',  # 从stdin读取
                     '-c:v', 'libx264',
                     '-pix_fmt', 'yuv420p',
-                    '-preset', 'ultrafast',
+                    '-preset', 'ultrafast',  # 使用最快的编码预设
+                    '-tune', 'zerolatency',  # 调整为低延迟模式
+                    '-b:v', '2M',            # 设置比特率为2Mbps
+                    '-maxrate', '10M',        # 最大比特率
+                    '-bufsize', '1M',        # 缓冲区大小
+                    '-g', '15',              # GOP大小设置小一点
+                    '-keyint_min', '15',     # 最小关键帧间隔
+                    '-sc_threshold', '0',    # 禁用场景变化检测
                     '-f', 'rtsp',
-                    '-tune', 'zerolatency',
                     '-rtsp_transport', 'tcp',
                     output_url
                 ]
