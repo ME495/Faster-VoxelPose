@@ -418,14 +418,21 @@ def inference_process(config, model_file, calibration_file, rtsp_url, fps_value,
             time.sleep(0.01)
             continue
         
-        frame = frame_queue.get()
-        if frame is None:
+        frame_or_views = frame_queue.get()
+        if frame_or_views is None:
             continue
             
         frame_count += 1
         
-        # 将单个帧拆分为多个视图
-        views, is_valid = split_frame(frame, image_size, config.DATASET.CAMERA_NUM)
+        # 检查是否已经是拆分的视图还是需要拆分
+        if isinstance(frame_or_views, list) and len(frame_or_views) == config.DATASET.CAMERA_NUM:
+            # 已经是拆分好的视图
+            views = frame_or_views
+            is_valid = True
+        else:
+            # 需要拆分
+            frame = frame_or_views
+            views, is_valid = split_frame(frame, image_size, config.DATASET.CAMERA_NUM)
         
         # 检查图像尺寸是否符合要求
         if not is_valid:
@@ -612,11 +619,12 @@ def main():
     fps_value = Value('d', 0.0)  # FPS值
     
     # 创建进程间通信队列
-    frame_queue = Queue(maxsize=10)  # 帧队列
+    frame_queue = Queue(maxsize=1)  # 帧队列
     result_queue = Queue(maxsize=5)  # 结果队列
     
-    # 初始化视频流读取器
-    rtsp_reader = RTSPReader(args.rtsp_url).start()
+    # 初始化视频流读取器 - 现在支持自动拆分帧
+    image_size = np.array(config.DATASET.IMAGE_SIZE)
+    rtsp_reader = RTSPReader(args.rtsp_url, image_size=image_size, num_views=config.DATASET.CAMERA_NUM, auto_split=True).start()
     time.sleep(1.0)  # 等待视频流初始化
     
     # 开启推理进程
