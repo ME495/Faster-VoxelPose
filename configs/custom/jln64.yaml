@@ -8,7 +8,7 @@ MODEL: 'faster_voxelpose'
 DEVICE: 'cuda:0'
 OUTPUT_DIR: 'output'
 LOG_DIR: 'log'
-WORKERS: 8
+WORKERS: 1
 PRINT_FREQ: 100
 
 DATASET:
