@@ -18,6 +18,7 @@ import numpy as np
 import json
 import multiprocessing as mp
 from multiprocessing import Process, Queue, Value, Array
+from concurrent.futures import ThreadPoolExecutor
 
 import _init_paths
 from core.config import config, update_config
@@ -25,10 +26,35 @@ from utils.utils import create_logger
 from utils.transforms import get_affine_transform, get_scale
 from utils.vis import test_vis_all
 from utils.rtsp_utils import RTSPReader
+from utils.cameras import project_pose
+from utils.transforms import affine_transform_pts_cuda as do_transform
 
 import models
 
-def render_result_on_image(config, meta, cameras, resize_transform, image, input_heatmaps, fused_poses):
+LIMBS15 = [[0, 1], [0, 2], [0, 3], [3, 4], [4, 5], [0, 9], [9, 10],
+           [10, 11], [2, 6], [2, 12], [6, 7], [7, 8], [12, 13], [13, 14]]
+
+LIMBS14 = [[0, 1], [1, 2], [3, 4], [4, 5], [2, 3], [6, 7], [7, 8], [9, 10],
+           [10, 11], [2, 8], [3, 9], [8, 12], [9, 12], [12, 13]]
+LIMBS17 = [[0, 1], [0, 2], [1, 2], [1, 3], [2, 4], [3, 5], [4, 6], [5, 7], [7, 9], [6, 8], [8, 10], [5, 11], [11, 13], [13, 15],
+           [6, 12], [12, 14], [14, 16], [5, 6], [11, 12]]
+
+# 可视化颜色
+colors = ['b', 'g', 'c', 'y', 'm', 'orange', 'pink', 'royalblue', 'lightgreen', 'gold']
+color_map = {
+    'b': (255, 0, 0),       # 蓝色 (BGR格式)
+    'g': (0, 255, 0),       # 绿色
+    'c': (255, 255, 0),     # 青色
+    'y': (0, 255, 255),     # 黄色
+    'm': (255, 0, 255),     # 洋红色
+    'orange': (0, 165, 255),# 橙色
+    'pink': (203, 192, 255),# 粉色
+    'royalblue': (225, 105, 65), # 宝蓝色
+    'lightgreen': (144, 238, 144), # 浅绿色
+    'gold': (0, 215, 255)   # 金色
+}
+
+def render_result_on_image(config, meta, cameras, resize_transform, image, fused_poses):
     """
     在图像上渲染3D姿态估计结果
     
@@ -38,42 +64,22 @@ def render_result_on_image(config, meta, cameras, resize_transform, image, input
         cameras: 相机参数
         resize_transform: 缩放变换矩阵
         image: 输入图像
-        input_heatmaps: 输入热图
         fused_poses: 融合后的3D姿态
         
     Returns:
         image: 渲染后的图像
     """
-    from utils.cameras import project_pose
-    from utils.transforms import affine_transform_pts_cuda as do_transform
+    
     
     batch_size, max_people, num_joints, _ = fused_poses.shape
     
     # 获取骨架连接
     if num_joints == 15:
-        limbs = LIMBS15 = [[0, 1], [0, 2], [0, 3], [3, 4], [4, 5], [0, 9], [9, 10],
-                 [10, 11], [2, 6], [2, 12], [6, 7], [7, 8], [12, 13], [13, 14]]
+        limbs = LIMBS15
     elif num_joints == 14:
-        limbs = LIMBS14 = [[0, 1], [1, 2], [3, 4], [4, 5], [2, 3], [6, 7], [7, 8], [9, 10],
-                  [10, 11], [2, 8], [3, 9], [8, 12], [9, 12], [12, 13]]
+        limbs = LIMBS14
     else:
-        limbs = LIMBS17 = [[0, 1], [0, 2], [1, 2], [1, 3], [2, 4], [3, 5], [4, 6], [5, 7], [7, 9], [6, 8], [8, 10], [5, 11], [11, 13], [13, 15],
-                [6, 12], [12, 14], [14, 16], [5, 6], [11, 12]]
-    
-    # 可视化颜色
-    colors = ['b', 'g', 'c', 'y', 'm', 'orange', 'pink', 'royalblue', 'lightgreen', 'gold']
-    color_map = {
-        'b': (255, 0, 0),       # 蓝色 (BGR格式)
-        'g': (0, 255, 0),       # 绿色
-        'c': (255, 255, 0),     # 青色
-        'y': (0, 255, 255),     # 黄色
-        'm': (255, 0, 255),     # 洋红色
-        'orange': (0, 165, 255),# 橙色
-        'pink': (203, 192, 255),# 粉色
-        'royalblue': (225, 105, 65), # 宝蓝色
-        'lightgreen': (144, 238, 144), # 浅绿色
-        'gold': (0, 215, 255)   # 金色
-    }
+        limbs = LIMBS17
     
     height, width = image.shape[:2]
     
@@ -105,8 +111,8 @@ def render_result_on_image(config, meta, cameras, resize_transform, image, input
                 # 绘制关节点
                 for j in range(num_joints):
                     if is_valid_coord(pose_2d[j], width // 2, height // 2):
-                        x = int(pose_2d[j][0] + x_offset)
-                        y = int(pose_2d[j][1] + y_offset)
+                        x = int(pose_2d[j][0]/2 + x_offset)
+                        y = int(pose_2d[j][1]/2 + y_offset)
                         cv2.circle(image, (x, y), 8, color, -1)
                 
                 # 绘制骨架连接
@@ -332,7 +338,7 @@ def setup_cameras(calibration_file=None, num_views=4):
         raise FileNotFoundError(f"错误：未提供相机标定文件或文件不存在！请使用--calibration_file参数指定有效的标定文件。")
 
 
-def inference_process(config, model_file, calibration_file, rtsp_url, fps_value, frame_queue, result_queue, stop_flag):
+def inference_process(config, model_file, calibration_file, rtsp_url, frame_queue, result_queue, stop_flag):
     """
     执行模型推理的进程
     
@@ -340,7 +346,6 @@ def inference_process(config, model_file, calibration_file, rtsp_url, fps_value,
         model_file: 模型文件路径
         calibration_file: 标定文件路径
         rtsp_url: RTSP视频流URL
-        fps_value: 共享的FPS值
         frame_queue: 帧队列
         result_queue: 结果队列
         stop_flag: 停止标志
@@ -403,10 +408,6 @@ def inference_process(config, model_file, calibration_file, rtsp_url, fps_value,
     trans = get_affine_transform(c, s, r, image_size)
     resize_transform = torch.as_tensor(trans, dtype=torch.float, device=config.DEVICE)
     
-    # 统计FPS
-    fps_time = time.time()
-    fps_count = 0
-    
     # 主循环
     print('=> 开始处理视频流')
     frame_count = 0
@@ -461,23 +462,21 @@ def inference_process(config, model_file, calibration_file, rtsp_url, fps_value,
         
         # 计算推理时间
         inference_time = time.time() - start_time
-        
-        # 计算FPS
-        fps_count += 1
-        if fps_count >= 10:
-            with fps_value.get_lock():
-                fps_value.value = fps_count / (time.time() - fps_time)
-            fps_time = time.time()
-            fps_count = 0
             
         # 将结果放入结果队列
         result_data = {
             'views': views,
             'meta': meta,
             'fused_poses': fused_poses.cpu().numpy(),
-            'input_heatmaps': input_heatmaps.cpu().numpy(),
             'inference_time': inference_time
         }
+        
+        # result_data = {
+        #     'views': views,
+        #     'meta': meta,
+        #     'fused_poses': np.zeros((1, 10, 15, 5)),
+        #     'inference_time': inference_time
+        # }
         
         # 如果队列已满，移除最旧的结果
         if result_queue.full():
@@ -491,7 +490,7 @@ def inference_process(config, model_file, calibration_file, rtsp_url, fps_value,
     print('推理进程结束')
 
 
-def visualization_process(config, calibration_file, view_mode, output_url, view_type, output_dir, fps_value, result_queue, stop_flag):
+def visualization_process(config, calibration_file, view_mode, output_url, view_type, output_dir, result_queue, stop_flag):
     """
     处理可视化的进程
     
@@ -500,7 +499,6 @@ def visualization_process(config, calibration_file, view_mode, output_url, view_
         output_url: 输出RTSP流URL
         view_type: 可视化类型
         output_dir: 输出目录
-        fps_value: 共享的FPS值
         result_queue: 结果队列
         stop_flag: 停止标志
     """
@@ -513,8 +511,8 @@ def visualization_process(config, calibration_file, view_mode, output_url, view_
             output_url = "output.mp4"  # 默认保存到本地文件
             
         image_size = np.array(config.DATASET.IMAGE_SIZE)
-        output_width = image_size[0] * 2
-        output_height = image_size[1] * 2
+        output_width = image_size[0]
+        output_height = image_size[1]
         
         try:
             # 尝试使用提供的本地文件路径或TCP/UDP端口
@@ -530,17 +528,15 @@ def visualization_process(config, calibration_file, view_mode, output_url, view_
                     '-r', '30',  # 30fps
                     '-i', '-',  # 从stdin读取
                     '-c:v', 'libx264',
-                    '-pix_fmt', 'yuv420p',
                     '-preset', 'ultrafast',  # 使用最快的编码预设
                     '-tune', 'zerolatency',  # 调整为低延迟模式
                     '-b:v', '2M',            # 设置比特率为2Mbps
-                    '-maxrate', '10M',        # 最大比特率
-                    '-bufsize', '1M',        # 缓冲区大小
-                    '-g', '15',              # GOP大小设置小一点
-                    '-keyint_min', '15',     # 最小关键帧间隔
-                    '-sc_threshold', '0',    # 禁用场景变化检测
+                    '-g', '5',              # GOP大小设置小一点
                     '-f', 'rtsp',
                     '-rtsp_transport', 'tcp',
+                    '-avioflags', 'direct',
+                    '-fflags', 'nobuffer',
+                    '-bf', '0',
                     output_url
                 ]
                 import subprocess
@@ -571,6 +567,32 @@ def visualization_process(config, calibration_file, view_mode, output_url, view_
     # 计算每帧间隔时间（30fps = 1/30秒）
     frame_interval = 1.0 / 30.0  # 秒
     
+    # 计算缩放变换矩阵
+    ori_image_size = np.array(config.DATASET.ORI_IMAGE_SIZE)
+    image_size = np.array(config.DATASET.IMAGE_SIZE)
+    c = np.array([ori_image_size[0] / 2.0, ori_image_size[1] / 2.0])
+    s = get_scale(ori_image_size, image_size)
+    r = 0
+    trans = get_affine_transform(c, s, r, image_size)
+    resize_transform = torch.as_tensor(trans, dtype=torch.float)
+    
+    # 用于计算实际FPS的变量
+    fps_frame_count = 0
+    fps_start_time = time.time()
+    current_fps = 0
+    
+    # 获取图像尺寸
+    image_size = np.array(config.DATASET.IMAGE_SIZE)
+    resize_image_size = image_size // 2
+    
+     # 创建相机参数对象
+    cameras = None
+    try:
+        cameras = setup_cameras(calibration_file=calibration_file, num_views=config.DATASET.CAMERA_NUM)
+    except Exception as e:
+        print(f"可视化进程无法加载相机参数: {str(e)}")
+        return
+    
     while not stop_flag.value:
         start_time = time.time()
         
@@ -590,57 +612,50 @@ def visualization_process(config, calibration_file, view_mode, output_url, view_
             time.sleep(0.01)
             continue
             
+        # FPS计算 - 增加帧计数
+        fps_frame_count += 1
+        
+        # 如果过去了1秒，计算并更新FPS
+        fps_elapsed_time = time.time() - fps_start_time
+        if fps_elapsed_time >= 1.0:
+            current_fps = fps_frame_count / fps_elapsed_time
+            print(f"当前FPS: {current_fps:.1f}")
+            fps_frame_count = 0
+            fps_start_time = time.time()
+        
         # 解包结果数据
         views = result_data['views']
         meta = result_data['meta']
         fused_poses = torch.from_numpy(result_data['fused_poses'])
-        input_heatmaps = torch.from_numpy(result_data['input_heatmaps'])
         inference_time = result_data['inference_time']
         
         # 处理结果可视化
         if view_mode != 'none':
             # 构建可视化图像
             if 'image_with_poses' in vis_types:
-                # 获取图像尺寸
-                image_size = np.array(config.DATASET.IMAGE_SIZE)
                 
                 # 合并四个视图并在其上绘制结果
-                vis_image = np.zeros((image_size[1] * 2, image_size[0] * 2, 3), dtype=np.uint8)
+                vis_image = np.zeros((image_size[1], image_size[0], 3), dtype=np.uint8)
                 
-                # 将拆分的视图放回原位
-                for i, view in enumerate(views):
-                    if view.shape[0] != image_size[1] or view.shape[1] != image_size[0]:
-                        view = cv2.resize(view, (image_size[0], image_size[1]))
-                    
-                    row = i // 2
-                    col = i % 2
-                    y_start = row * image_size[1]
-                    x_start = col * image_size[0]
-                    vis_image[y_start:y_start+image_size[1], x_start:x_start+image_size[0]] = view
+                # 并行处理视图的缩放操作
+                def resize_view(view):
+                    if view.shape[0] != resize_image_size[1] or view.shape[1] != resize_image_size[0]:
+                        return cv2.resize(view, (resize_image_size[0], resize_image_size[1]), interpolation=cv2.INTER_NEAREST)
+                    return view
                 
-                # 计算缩放变换矩阵
-                ori_image_size = np.array(config.DATASET.ORI_IMAGE_SIZE)
-                c = np.array([ori_image_size[0] / 2.0, ori_image_size[1] / 2.0])
-                s = get_scale(ori_image_size, image_size)
-                r = 0
-                trans = get_affine_transform(c, s, r, image_size)
-                resize_transform = torch.as_tensor(trans, dtype=torch.float)
+                # 使用线程池并行处理所有视图的缩放
+                with ThreadPoolExecutor(max_workers=4) as executor:
+                    resized_views = list(executor.map(resize_view, views))
                 
-                # 创建相机参数对象
-                cameras = None
-                try:
-                    cameras = setup_cameras(calibration_file=calibration_file, num_views=config.DATASET.CAMERA_NUM)
-                except Exception as e:
-                    print(f"可视化进程无法加载相机参数: {str(e)}")
-                    continue
+                # 放置所有视图（左上、右上、左下、右下）
+                vis_image[:resize_image_size[1], :resize_image_size[0]] = resized_views[0]
+                vis_image[:resize_image_size[1], resize_image_size[0]:] = resized_views[1]
+                vis_image[resize_image_size[1]:, :resize_image_size[0]] = resized_views[2]
+                vis_image[resize_image_size[1]:, resize_image_size[0]:] = resized_views[3]
                 
                 # 在图像上渲染3D姿态结果
-                vis_image = render_result_on_image(config, meta, cameras, resize_transform, vis_image, input_heatmaps, fused_poses)
+                vis_image = render_result_on_image(config, meta, cameras, resize_transform, vis_image, fused_poses)
                 
-                # 添加FPS信息
-                with fps_value.get_lock():
-                    fps = fps_value.value
-                cv2.putText(vis_image, f"FPS: {fps:.1f}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
                 cv2.putText(vis_image, f"Inference time: {inference_time*1000:.1f}ms", (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
                 
                 # 根据可视化模式处理
@@ -700,7 +715,6 @@ def main():
     
     # 创建共享变量
     stop_flag = Value('i', 0)  # 停止标志
-    fps_value = Value('d', 0.0)  # FPS值
     
     # 创建进程间通信队列
     frame_queue = Queue(maxsize=1)  # 帧队列
@@ -722,7 +736,6 @@ def main():
             model_file,
             args.calibration_file,
             args.rtsp_url,
-            fps_value,
             frame_queue,
             result_queue,
             stop_flag
@@ -741,7 +754,6 @@ def main():
             args.output_url,
             args.view_type,
             args.output_dir,
-            fps_value,
             result_queue,
             stop_flag
         )
@@ -772,12 +784,6 @@ def main():
                     
             # 放入帧队列
             frame_queue.put(frame)
-            
-            # # 定期输出状态
-            # with fps_value.get_lock():
-            #     current_fps = fps_value.value
-            # if current_fps > 0:
-            #     logger.info(f'FPS: {current_fps:.1f}')
                 
             time.sleep(0.001)  # 避免CPU空转
     

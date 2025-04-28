@@ -50,6 +50,11 @@ class RTSPReader:
         print(f"成功连接RTSP流: {self.rtsp_url}")
         print(f"视频属性: {cap.get(cv2.CAP_PROP_FRAME_WIDTH)}x{cap.get(cv2.CAP_PROP_FRAME_HEIGHT)}@{cap.get(cv2.CAP_PROP_FPS)}fps")
 
+        # FPS计算变量
+        fps = 0
+        frame_count = 0
+        start_time = time.time()
+
         while not self.stopped:
             # 读取帧
             ret, frame = cap.read()
@@ -67,6 +72,21 @@ class RTSPReader:
                     continue
                 
                 continue
+            
+            # 计算FPS
+            frame_count += 1
+            elapsed_time = time.time() - start_time
+            if elapsed_time >= 1.0:  # 每秒更新一次FPS
+                fps = frame_count / elapsed_time
+                print(f"RTSPReader FPS: {fps:.2f}")
+                frame_count = 0
+                start_time = time.time()
+            
+            if self.auto_split and self.image_size is None:
+                # 自动拆分多视角画面
+                views, is_valid = self.split_frame(frame)
+                if is_valid:
+                    frame = views
                 
             # 如果队列已满，移除最旧的帧
             if self.frame_queue.full():
@@ -86,6 +106,8 @@ class RTSPReader:
             return None
             
         frame = self.frame_queue.get()
+        
+        return frame
         
         # 如果不需要自动拆分或者没有指定图像尺寸，则直接返回完整帧
         if not self.auto_split or self.image_size is None:
