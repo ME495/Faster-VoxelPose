@@ -78,7 +78,7 @@ class RTSPReader:
             elapsed_time = time.time() - start_time
             if elapsed_time >= 1.0:  # 每秒更新一次FPS
                 fps = frame_count / elapsed_time
-                print(f"RTSPReader FPS: {fps:.2f}")
+                # print(f"RTSPReader FPS: {fps:.2f}")
                 frame_count = 0
                 start_time = time.time()
             
