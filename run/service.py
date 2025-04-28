@@ -107,12 +107,13 @@ def render_result_on_image(config, meta, cameras, resize_transform, image, fused
                 # 投影3D姿态到2D视图
                 pose_2d = project_pose(fused_poses[i, n, :, :3], camera)
                 pose_2d = do_transform(pose_2d, resize_transform)
+                pose_2d /= 2.0
                 
                 # 绘制关节点
                 for j in range(num_joints):
-                    if is_valid_coord(pose_2d[j], width // 2, height // 2):
-                        x = int(pose_2d[j][0]/2 + x_offset)
-                        y = int(pose_2d[j][1]/2 + y_offset)
+                    if is_valid_coord(pose_2d[j], width, height):
+                        x = int(pose_2d[j][0] + x_offset)
+                        y = int(pose_2d[j][1] + y_offset)
                         cv2.circle(image, (x, y), 8, color, -1)
                 
                 # 绘制骨架连接
@@ -120,8 +121,8 @@ def render_result_on_image(config, meta, cameras, resize_transform, image, fused
                     parent = pose_2d[limb[0]]
                     child = pose_2d[limb[1]]
                     
-                    if not is_valid_coord(parent, width // 2, height // 2) or \
-                       not is_valid_coord(child, width // 2, height // 2):
+                    if not is_valid_coord(parent, width, height) or \
+                       not is_valid_coord(child, width, height):
                         continue
                     
                     px = int(parent[0] + x_offset)
@@ -412,6 +413,9 @@ def inference_process(config, model_file, calibration_file, rtsp_url, frame_queu
     print('=> 开始处理视频流')
     frame_count = 0
     skipped_count = 0
+    fps_start_time = time.time()
+    fps_interval = 3
+    fps = 0
     
     while not stop_flag.value:
         # 从队列获取帧
@@ -440,15 +444,15 @@ def inference_process(config, model_file, calibration_file, rtsp_url, frame_queu
             skipped_count += 1
             continue
         
-        # 记录起始时间
-        start_time = time.time()
-        
         # 准备输入数据
         inputs = prepare_input(views, transform)
         inputs = inputs.to(config.DEVICE)
         
         # 创建元数据
         meta = {'seq': ['default']}
+        
+        # 记录起始时间
+        start_time = time.time()
         
         # 前向推理
         with torch.no_grad():
@@ -468,7 +472,8 @@ def inference_process(config, model_file, calibration_file, rtsp_url, frame_queu
             'views': views,
             'meta': meta,
             'fused_poses': fused_poses.cpu().numpy(),
-            'inference_time': inference_time
+            'inference_time': inference_time,
+            'fps': fps
         }
         
         # result_data = {
@@ -486,6 +491,14 @@ def inference_process(config, model_file, calibration_file, rtsp_url, frame_queu
                 pass
                 
         result_queue.put(result_data)
+        
+        # 计算FPS
+        if frame_count == fps_interval:  # 每fps_interval帧计算一次FPS
+            current_time = time.time()
+            elapsed_time = current_time - fps_start_time
+            fps = fps_interval / elapsed_time  # 计算最近fps_interval帧的FPS
+            fps_start_time = current_time  # 重置起始时间
+            frame_count = 0
     
     print('推理进程结束')
 
@@ -619,7 +632,7 @@ def visualization_process(config, calibration_file, view_mode, output_url, view_
         fps_elapsed_time = time.time() - fps_start_time
         if fps_elapsed_time >= 1.0:
             current_fps = fps_frame_count / fps_elapsed_time
-            print(f"当前FPS: {current_fps:.1f}")
+            print(f"visualization FPS: {current_fps:.1f}")
             fps_frame_count = 0
             fps_start_time = time.time()
         
@@ -628,6 +641,7 @@ def visualization_process(config, calibration_file, view_mode, output_url, view_
         meta = result_data['meta']
         fused_poses = torch.from_numpy(result_data['fused_poses'])
         inference_time = result_data['inference_time']
+        inference_fps = result_data['fps']
         
         # 处理结果可视化
         if view_mode != 'none':
@@ -656,6 +670,7 @@ def visualization_process(config, calibration_file, view_mode, output_url, view_
                 # 在图像上渲染3D姿态结果
                 vis_image = render_result_on_image(config, meta, cameras, resize_transform, vis_image, fused_poses)
                 
+                cv2.putText(vis_image, f"FPS: {inference_fps:.1f}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
                 cv2.putText(vis_image, f"Inference time: {inference_time*1000:.1f}ms", (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
                 
                 # 根据可视化模式处理
