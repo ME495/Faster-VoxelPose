@@ -4,7 +4,7 @@ import os
 from multiprocessing import Process, Queue
 import numpy as np
 
-os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|fflags;nobuffer|max_delay;0|reorder_queue_size;0|rtsp_flags;prefer_tcp|analyzeduration;0|probesize;32768|sync;ext"
+os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|fflags;nobuffer|max_delay;0|reorder_queue_size;0|rtsp_flags;prefer_tcp|analyzeduration;0|probesize;32768|sync;ext|hwaccel;cuda|hwaccel_output_format;cuda"
 
 
 class RTSPReader:
@@ -37,7 +37,11 @@ class RTSPReader:
         # 使用cv2.CAP_FFMPEG后端创建VideoCapture对象
         cap = cv2.VideoCapture(self.rtsp_url, cv2.CAP_FFMPEG)
         
+        # 配置H264编解码器
         cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'H264'))
+        
+        # 启用硬件加速
+        cap.set(cv2.CAP_PROP_HW_ACCELERATION, cv2.VIDEO_ACCELERATION_ANY)
         
         if not cap.isOpened():
             print(f"错误: 无法打开RTSP流，URL: {self.rtsp_url}")
@@ -49,6 +53,7 @@ class RTSPReader:
         
         print(f"成功连接RTSP流: {self.rtsp_url}")
         print(f"视频属性: {cap.get(cv2.CAP_PROP_FRAME_WIDTH)}x{cap.get(cv2.CAP_PROP_FRAME_HEIGHT)}@{cap.get(cv2.CAP_PROP_FPS)}fps")
+        print(f"硬件加速状态: {cap.get(cv2.CAP_PROP_HW_ACCELERATION)}")
 
         # FPS计算变量
         fps = 0
@@ -65,6 +70,10 @@ class RTSPReader:
                 # 尝试重新连接
                 cap.release()
                 cap = cv2.VideoCapture(self.rtsp_url, cv2.CAP_FFMPEG)
+                
+                # 重新配置GPU解码
+                cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'H264'))
+                cap.set(cv2.CAP_PROP_HW_ACCELERATION, cv2.VIDEO_ACCELERATION_ANY)
                 
                 if not cap.isOpened():
                     print(f"错误: 重新连接失败")

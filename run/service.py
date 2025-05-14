@@ -534,15 +534,18 @@ def visualization_process(config, calibration_file, view_mode, output_url, view_
                 cmd = [
                     'ffmpeg',
                     '-y',  # 覆盖现有文件
+                    '-hwaccel', 'cuda', 
+                    '-hwaccel_output_format', 'cuda',
                     '-f', 'rawvideo',
                     '-vcodec', 'rawvideo',
                     '-pix_fmt', 'bgr24',
                     '-s', f'{output_width}x{output_height}',
                     '-r', '30',  # 30fps
                     '-i', '-',  # 从stdin读取
-                    '-c:v', 'libx264',
-                    '-preset', 'ultrafast',  # 使用最快的编码预设
-                    '-tune', 'zerolatency',  # 调整为低延迟模式
+                    '-c:v', 'h264_nvenc',
+                    '-preset', 'p4',  # 使用最快的编码预设
+                    '-tune', 'ull',  # 调整为低延迟模式
+                    '-zerolatency', '1',
                     '-b:v', '2M',            # 设置比特率为2Mbps
                     '-g', '5',              # GOP大小设置小一点
                     '-f', 'rtsp',
@@ -554,7 +557,7 @@ def visualization_process(config, calibration_file, view_mode, output_url, view_
                 ]
                 import subprocess
                 writer = subprocess.Popen(
-                    cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                    cmd, stdin=subprocess.PIPE
                 )
                 print(f"成功创建RTSP流: {output_url}")
             else:
