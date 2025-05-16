@@ -66,20 +66,21 @@ class ProjectLayerTS(nn.Module):
         self.ori_image_size = ori_image_size  # 原始图像尺寸
 
         # 反投影所需的常量参数
-        self.whole_space_center = torch.tensor(space_center)  # 全局空间中心
-        self.whole_space_size = torch.tensor(space_size)  # 全局空间大小
-        self.ind_space_size = torch.tensor(individual_space_size)  # 个体空间大小
-        self.voxels_per_axis = torch.tensor(voxels_per_axis, dtype=torch.int32)  # 个体体素每轴体素数
+        self.register_buffer('whole_space_center', torch.tensor(space_center))  # 全局空间中心
+        self.register_buffer('whole_space_size', torch.tensor(space_size))  # 全局空间大小
+        self.register_buffer('ind_space_size', torch.tensor(individual_space_size))  # 个体空间大小
+        self.register_buffer('voxels_per_axis', torch.tensor(voxels_per_axis, dtype=torch.int32))  # 个体体素每轴体素数
         
         # 计算在全局空间中对应的精细体素尺寸
-        self.fine_voxels_per_axis = (self.whole_space_size / self.ind_space_size * (self.voxels_per_axis - 1)).int() + 1
+        self.register_buffer('fine_voxels_per_axis', 
+                           (self.whole_space_size / self.ind_space_size * (self.voxels_per_axis - 1)).int() + 1)
 
         # 计算坐标转换参数
-        self.scale = (self.fine_voxels_per_axis.float() - 1)  / self.whole_space_size  # 缩放因子
-        self.bias = - self.ind_space_size / 2.0 / self.whole_space_size * (self.fine_voxels_per_axis - 1)\
-                    - self.scale * (self.whole_space_center - self.whole_space_size / 2.0)  # 偏移量
+        self.register_buffer('scale', (self.fine_voxels_per_axis.float() - 1) / self.whole_space_size)  # 缩放因子
+        self.register_buffer('bias', - self.ind_space_size / 2.0 / self.whole_space_size * (self.fine_voxels_per_axis - 1)\
+                    - self.scale * (self.whole_space_center - self.whole_space_size / 2.0))  # 偏移量
         
-         # 预先计算网格
+        # 预先计算网格
         self._save_grid() 
 
     def _save_grid(self):
@@ -95,9 +96,9 @@ class ProjectLayerTS(nn.Module):
         grid = grid.view(self.voxels_per_axis[0], self.voxels_per_axis[1], self.voxels_per_axis[2], 3)
         
         # 提取三个正交平面(xy, xz, yz)的2D网格，用于后续的软性坐标回归
-        self.center_grid = torch.stack([grid[:, :, 0, :2].reshape(-1, 2),  # xy平面
+        self.register_buffer('center_grid', torch.stack([grid[:, :, 0, :2].reshape(-1, 2),  # xy平面
                                         grid[:, 0, :, ::2].reshape(-1, 2),  # xz平面
-                                        grid[0, :, :, 1:].reshape(-1, 2)])  # yz平面
+                                        grid[0, :, :, 1:].reshape(-1, 2)]))  # yz平面
 
     def _compute_grid(self, boxSize: torch.Tensor, boxCenter: torch.Tensor, nBins: torch.Tensor):
         """
@@ -203,7 +204,7 @@ class ProjectLayerTS(nn.Module):
             end_y = end[i, 1].item()
             end_z = end[i, 2].item()
             
-            sample_grid = fine_sample_grids[index, :, start_x:end_x, start_y:end_y, start_z:end_z].reshape(n, 1, -1, 2)
+            sample_grid = fine_sample_grids[:, start_x:end_x, start_y:end_y, start_z:end_z].reshape(n, 1, -1, 2)
 
             # 使用grid_sample从多视角热图中采样特征，然后取平均
             accu_cubes = torch.mean(F.grid_sample(heatmaps[index], sample_grid, align_corners=True), dim=0)

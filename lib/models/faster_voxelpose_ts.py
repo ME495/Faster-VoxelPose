@@ -60,7 +60,7 @@ class FasterVoxelPoseNetTS(nn.Module):
                                                 cfg.DATASET.ORI_IMAGE_SIZE,
                                                 cfg.CAPTURE_SPEC.SPACE_CENTER,
                                                 cfg.CAPTURE_SPEC.SPACE_SIZE,
-                                                cfg.CAPTURE_SPEC.VOXELS_PER_AXIS,
+                                                cfg.INDIVIDUAL_SPEC.SPACE_SIZE,
                                                 cfg.NETWORK.BETA)  # 关节定位网络
 
 

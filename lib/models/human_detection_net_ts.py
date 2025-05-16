@@ -118,8 +118,8 @@ class ProposalLayerTS(nn.Module):
         self.min_score = min_score  # 最小置信度阈值
 
         # 用于将体素坐标转换为实际3D坐标的常量
-        self.scale = (torch.tensor(space_size) / (torch.tensor(voxels_per_axis) - 1.0))
-        self.bias = (torch.tensor(space_center) - torch.tensor(space_size) / 2.0)
+        self.register_buffer('scale', torch.tensor(space_size) / (torch.tensor(voxels_per_axis) - 1.0))
+        self.register_buffer('bias', torch.tensor(space_center) - torch.tensor(space_size) / 2.0)
 
     def forward(self, topk_index: torch.Tensor, topk_confs: torch.Tensor, match_bbox_preds: torch.Tensor) -> torch.Tensor:
         """

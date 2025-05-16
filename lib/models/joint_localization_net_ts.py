@@ -211,7 +211,6 @@ class JointLocalizationNetTS(nn.Module):
 
             # 计算融合权重并获得最终预测
             weights = self.weight_net(joint_features)  # 预测融合权重
-            print(weights.shape)
             fused_pose_preds = self.fuse_pose_preds(pose_preds, weights)  # 融合三个平面的预测
 
             # 将当前批次的结果保存到输出张量中

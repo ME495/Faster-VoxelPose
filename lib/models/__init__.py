@@ -13,3 +13,8 @@ import models.project_whole
 import models.project_individual
 import models.human_detection_net
 import models.joint_localization_net
+
+import models.faster_voxelpose_ts
+import models.project_individual_ts
+import models.joint_localization_net_ts
+
