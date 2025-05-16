@@ -216,13 +216,15 @@ def main():
             
             if config.DATASET.TEST_HEATMAP_SRC == 'image':
                 inputs = inputs.to(config.DEVICE)
-                input_heatmaps = scripted_backbone(inputs.view(-1, 3, inputs.shape[3], inputs.shape[4]))
-                input_heatmaps = input_heatmaps.view(-1, config.DATASET.CAMERA_NUM, input_heatmaps.shape[1], input_heatmaps.shape[2], input_heatmaps.shape[3])
-                sample_grids = [sample_grids_dict[meta['seq'][j]] for j in range(input_heatmaps.shape[0])]
-                sample_grids = torch.cat(sample_grids, dim=0)
-                fine_sample_grids = [fine_sample_grids_dict[meta['seq'][j]] for j in range(input_heatmaps.shape[0])]
-                fine_sample_grids = torch.cat(fine_sample_grids, dim=0)
-                fused_poses = scripted_model(input_heatmaps, sample_grids, fine_sample_grids)
+                
+                with torch.amp.autocast('cuda'):
+                    input_heatmaps = scripted_backbone(inputs.view(-1, 3, inputs.shape[3], inputs.shape[4]))
+                    input_heatmaps = input_heatmaps.view(-1, config.DATASET.CAMERA_NUM, input_heatmaps.shape[1], input_heatmaps.shape[2], input_heatmaps.shape[3])
+                    sample_grids = [sample_grids_dict[meta['seq'][j]] for j in range(input_heatmaps.shape[0])]
+                    sample_grids = torch.cat(sample_grids, dim=0)
+                    fine_sample_grids = [fine_sample_grids_dict[meta['seq'][j]] for j in range(input_heatmaps.shape[0])]
+                    fine_sample_grids = torch.cat(fine_sample_grids, dim=0)
+                    fused_poses = scripted_model(input_heatmaps, sample_grids, fine_sample_grids)
             else:
                 raise ValueError('test heatmap source must be image!')
             
@@ -248,12 +250,12 @@ def main():
         mean_inference_time = np.mean(inference_times)
         mean_fps = 1.0 / mean_inference_time
         
-        # 忽略第一次迭代的预热时间，重新计算
-        if len(inference_times) > 1:
-            inference_times_no_first = inference_times[1:]
+        # 忽略前10次迭代的预热时间，重新计算
+        if len(inference_times) > 10:
+            inference_times_no_first = inference_times[10:]
             mean_inference_time_no_first = np.mean(inference_times_no_first)
             mean_fps_no_first = 1.0 / mean_inference_time_no_first
-            logger.info(f'平均推理时间(忽略第一次): {mean_inference_time_no_first:.4f}秒, FPS: {mean_fps_no_first:.2f}')
+            logger.info(f'平均推理时间(忽略前10次): {mean_inference_time_no_first:.4f}秒, FPS: {mean_fps_no_first:.2f}')
         
         logger.info(f'平均推理时间: {mean_inference_time:.4f}秒, FPS: {mean_fps:.2f}')
         logger.info(f'最快推理时间: {np.min(inference_times):.4f}秒, 最慢: {np.max(inference_times):.4f}秒')
