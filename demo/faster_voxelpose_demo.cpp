@@ -288,6 +288,9 @@ int main(int argc, const char* argv[]) {
 
     torch::NoGradGuard no_grad;
     long long total_duration_ms = 0;
+    long long total_image_processing_ms = 0;
+    long long total_heatmap_extraction_ms = 0;
+    long long total_pose_estimation_ms = 0;
     int frames_processed_for_fps = 0;
     int warmup_frames = 10;
 
@@ -298,7 +301,10 @@ int main(int argc, const char* argv[]) {
              std::cout << "Processing frame " << frame_idx + 1 << "/" << frames_to_run << std::endl;
         }
 
-        auto frame_start_time = std::chrono::high_resolution_clock::now();
+        auto overall_frame_start_time = std::chrono::high_resolution_clock::now();
+
+        // --- 1. 图像处理计时开始 ---
+        auto image_processing_start_time = std::chrono::high_resolution_clock::now();
 
         std::vector<std::future<torch::Tensor>> image_futures;
         for (int cam_idx = 0; cam_idx < NUM_CAMERAS; ++cam_idx) {
@@ -322,39 +328,76 @@ int main(int argc, const char* argv[]) {
             std::cerr << "Error: Not enough images loaded for frame " << frame_idx << std::endl;
             continue;
         }
+        // --- 1. 图像处理计时结束 ---
+        auto image_processing_end_time = std::chrono::high_resolution_clock::now();
+        if (device_type == torch::kCUDA) { // 确保所有可能的to(device)操作完成
+            torch::cuda::synchronize();
+            image_processing_end_time = std::chrono::high_resolution_clock::now(); // 重新获取时间
+        }
+
+        // --- 2. Heatmap提取计时开始 ---
+        auto heatmap_extraction_start_time = std::chrono::high_resolution_clock::now();
 
         torch::Tensor batch_input = torch::cat(batch_tensors, 0);  // [NUM_CAMERAS, 3, H, W]
-        torch::Tensor batch_heatmaps = backbone_module.forward({batch_input}).toTensor();
-        torch::Tensor input_heatmaps_for_model = torch::cat(batch_heatmaps, 0).unsqueeze(0); // [1, NUM_CAMERAS, 3, H, W]
+        torch::Tensor batch_heatmaps = backbone_module.forward({batch_input}).toTensor().unsqueeze(0);
+        
+        // --- 2. Heatmap提取计时结束 ---
+        auto heatmap_extraction_end_time = std::chrono::high_resolution_clock::now();
+        if (device_type == torch::kCUDA) {
+            torch::cuda::synchronize();
+            heatmap_extraction_end_time = std::chrono::high_resolution_clock::now(); // 重新获取时间
+        }
+
+        // --- 3. 姿态估计计时开始 ---
+        auto pose_estimation_start_time = std::chrono::high_resolution_clock::now();
 
         std::vector<torch::jit::IValue> model_inputs;
-        model_inputs.push_back(input_heatmaps_for_model);
+        model_inputs.push_back(batch_heatmaps);
         model_inputs.push_back(final_sample_grid_coarse); 
         model_inputs.push_back(final_sample_grid_fine);
 
         torch::Tensor fused_poses = model_module.forward(model_inputs).toTensor();
         
+        // --- 3. 姿态估计计时结束 ---
+        auto pose_estimation_end_time = std::chrono::high_resolution_clock::now();
         if (device_type == torch::kCUDA) {
-            torch::cuda::synchronize(); // Ensure all CUDA ops are done before timing
+            torch::cuda::synchronize(); 
+            pose_estimation_end_time = std::chrono::high_resolution_clock::now(); // 重新获取时间
         }
-        auto frame_end_time = std::chrono::high_resolution_clock::now();
+
+        auto overall_frame_end_time = std::chrono::high_resolution_clock::now();
         
         if (frame_idx >= warmup_frames) { // Start timing after warmup
-            auto frame_duration = std::chrono::duration_cast<std::chrono::milliseconds>(frame_end_time - frame_start_time);
-            total_duration_ms += frame_duration.count();
+            auto image_processing_duration = std::chrono::duration_cast<std::chrono::milliseconds>(image_processing_end_time - image_processing_start_time);
+            total_image_processing_ms += image_processing_duration.count();
+
+            auto heatmap_extraction_duration = std::chrono::duration_cast<std::chrono::milliseconds>(heatmap_extraction_end_time - heatmap_extraction_start_time);
+            total_heatmap_extraction_ms += heatmap_extraction_duration.count();
+
+            auto pose_estimation_duration = std::chrono::duration_cast<std::chrono::milliseconds>(pose_estimation_end_time - pose_estimation_start_time);
+            total_pose_estimation_ms += pose_estimation_duration.count();
+            
+            auto overall_frame_duration = std::chrono::duration_cast<std::chrono::milliseconds>(overall_frame_end_time - overall_frame_start_time);
+            total_duration_ms += overall_frame_duration.count();
             frames_processed_for_fps++;
         }
-        // Optionally, do something with fused_poses here (e.g., visualization, saving)
     }
 
     std::cout << "-------------------------------------" << std::endl;
     std::cout << "Finished processing image sequence." << std::endl;
     if (frames_processed_for_fps > 0) {
-        double avg_time_per_frame_ms = static_cast<double>(total_duration_ms) / frames_processed_for_fps;
-        double fps = 1000.0 / avg_time_per_frame_ms;
+        double avg_overall_time_per_frame_ms = static_cast<double>(total_duration_ms) / frames_processed_for_fps;
+        double avg_image_processing_ms = static_cast<double>(total_image_processing_ms) / frames_processed_for_fps;
+        double avg_heatmap_extraction_ms = static_cast<double>(total_heatmap_extraction_ms) / frames_processed_for_fps;
+        double avg_pose_estimation_ms = static_cast<double>(total_pose_estimation_ms) / frames_processed_for_fps;
+        double fps = 1000.0 / avg_overall_time_per_frame_ms;
+
         std::cout << "Frames processed for FPS: " << frames_processed_for_fps << std::endl;
         std::cout << "Total processing time (after warmup): " << total_duration_ms << " ms" << std::endl;
-        std::cout << "Average time per frame: " << std::fixed << std::setprecision(2) << avg_time_per_frame_ms << " ms" << std::endl;
+        std::cout << "Average time per frame (Overall): " << std::fixed << std::setprecision(2) << avg_overall_time_per_frame_ms << " ms" << std::endl;
+        std::cout << "  Average Image Processing time: " << std::fixed << std::setprecision(2) << avg_image_processing_ms << " ms" << std::endl;
+        std::cout << "  Average Heatmap Extraction time: " << std::fixed << std::setprecision(2) << avg_heatmap_extraction_ms << " ms" << std::endl;
+        std::cout << "  Average Pose Estimation time: " << std::fixed << std::setprecision(2) << avg_pose_estimation_ms << " ms" << std::endl;
         std::cout << "FPS: " << std::fixed << std::setprecision(2) << fps << std::endl;
     } else {
         std::cout << "Not enough frames processed after warmup to calculate FPS." << std::endl;
