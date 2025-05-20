@@ -7,6 +7,17 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON) # Ensure compile_commands.json is generate
 
 set(CMAKE_BUILD_TYPE "Debug")
 
+# 源文件
+set(SOURCES
+    src/main.cpp
+    src/types.cpp
+    src/camera.cpp
+    src/projection.cpp
+    src/utils.cpp
+    src/visualization.cpp
+    src/image_processing.cpp
+)
+
 # set(CAFFE2_USE_CUDNN ON) # This line is generally for Caffe2, LibTorch handles its own cuDNN
 
 # --- LibTorch --- 
@@ -32,15 +43,13 @@ if(NOT OpenCV_FOUND)
     message(FATAL_ERROR "OpenCV not found. Please set OpenCV_DIR correctly.")
 endif()
 
-include_directories(${TORCH_INCLUDE_DIRS} ${OpenCV_INCLUDE_DIRS})
-
-add_executable(faster_voxelpose_demo faster_voxelpose_demo.cpp)
-
-target_include_directories(faster_voxelpose_demo PRIVATE 
+include_directories(
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${TORCH_INCLUDE_DIRS}
     ${OpenCV_INCLUDE_DIRS}
-    include
 )
+
+add_executable(faster_voxelpose_demo ${SOURCES})
 
 target_link_libraries(faster_voxelpose_demo
     "${TORCH_LIBRARIES}"
