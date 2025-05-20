@@ -1,6 +1,8 @@
 #include <torch/script.h>
 #include <torch/torch.h>
 #include <opencv2/opencv.hpp>
+#include <opencv2/imgcodecs.hpp> // For cv::imwrite
+#include <opencv2/imgproc.hpp>   // For cv::circle, cv::line, cv::cvtColor
 #include <nlohmann/json.hpp>
 #include <iostream>
 #include <vector>
@@ -11,6 +13,12 @@
 #include <algorithm> // For std::sort, std::min
 #include <iomanip>   // For std::fixed, std::setprecision
 #include <future>    // For std::async
+#include <map>       // For LIMBS definition
+#include <cmath>     // For M_PI
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
 
 namespace fs = std::filesystem;
 using json = nlohmann::json;
@@ -37,6 +45,17 @@ struct CameraParams {
         p_dist(torch::zeros({2,1}, torch::kFloat32)),
         id("unknown")
     {}
+
+    CameraParams to(torch::Device device) {
+        R = R.to(device);
+        T = T.to(device);
+        K_intrinsic = K_intrinsic.to(device);
+        f = f.to(device);
+        c = c.to(device);
+        k_dist = k_dist.to(device);
+        p_dist = p_dist.to(device);
+        return *this;
+    }
 };
 
 // Function to list image files in a directory, sorted alphabetically
@@ -63,41 +82,103 @@ std::vector<std::string> list_image_files(const std::string& dir_path) {
 torch::Tensor get_resize_affine_transform_cpp(const std::vector<int>& ori_size, 
                                               const std::vector<int>& new_size, 
                                               torch::Device device) {
-    // For r=0, shift=0, this simplifies significantly.
-    // The Python version uses a scale factor of 200 for intermediate `scale_tmp`,
-    // which is a convention in that codebase. We need to be careful if it affects the matrix ratios.
-    // Let's assume direct scaling based on original and new size for simplicity in a demo.
-    // If `get_affine_transform` in Python produces a matrix not equivalent to simple scaling + translation 
-    // due to its internal logic (like `scale_tmp`), this C++ version might need refinement.
+    // ori_size: {width, height} of original image
+    // new_size: {width, height} of target image
 
-    float scale_x = static_cast<float>(new_size[0]) / static_cast<float>(ori_size[0]);
-    float scale_y = static_cast<float>(new_size[1]) / static_cast<float>(ori_size[1]);
+    // 1. Calculate center of original image
+    std::vector<float> center = {
+        static_cast<float>(ori_size[0]) / 2.0f,
+        static_cast<float>(ori_size[1]) / 2.0f
+    };
 
-    // Create a 2x3 affine matrix for cv::warpAffine or similar PyTorch operations
-    // [ scale_x, 0,       translation_x ]
-    // [ 0,       scale_y, translation_y ]
-    // For simple resize, translation is 0 if scaling from origin.
-    // PyTorch affine_grid and grid_sample expect normalized coordinates, so the transform should map pixel coords.
-    // However, the `resize_transform` in `validate_ts.py` is used by `affine_transform_pts_cuda` 
-    // which expects a 2x3 matrix.
+    // 2. Calculate scale based on the Python get_scale logic
+    float w = static_cast<float>(ori_size[0]);
+    float h = static_cast<float>(ori_size[1]);
+    float w_resized = static_cast<float>(new_size[0]);
+    float h_resized = static_cast<float>(new_size[1]);
+    
+    float w_pad, h_pad;
+    if (w / w_resized < h / h_resized) {
+        w_pad = h / h_resized * w_resized;
+        h_pad = h;
+    } else {
+        w_pad = w;
+        h_pad = w / w_resized * h_resized;
+    }
+    
+    std::vector<float> scale = {w_pad / 200.0f, h_pad / 200.0f};
+    
+    // Define output size and other parameters aligned with Python implementation
+    float rot = 0.0f; // No rotation for resize operation
+    std::vector<float> shift = {0.0f, 0.0f}; // No shift
+    bool inv = false;
 
-    // The Python's `get_affine_transform` with rot=0, shift=[0,0]
-    // src[0,:] = center
-    // dst[0,:] = [dst_w * 0.5, dst_h * 0.5]
-    // Effectively, it maps the center of the source to the center of the destination,
-    // and scales based on `scale_tmp` then maps points.
-    // For simple resize from (0,0) to (new_w, new_h) from (0,0) to (ori_w, ori_h):
-    // x' = x * new_w / ori_w
-    // y' = y * new_h / ori_h
-    // This corresponds to an affine matrix:
-    // [[new_w/ori_w, 0, 0],
-    //  [0, new_h/ori_h, 0]]
+    // Follow the Python implementation logic
+    std::vector<float> scale_tmp = {scale[0] * 200.0f, scale[1] * 200.0f};
+    float src_w = scale_tmp[0];
+    float src_h = scale_tmp[1];
+    float dst_w = static_cast<float>(new_size[0]);
+    float dst_h = static_cast<float>(new_size[1]);
 
-    // torch::Tensor trans = torch::zeros({2, 3}, torch::kFloat32, device);
-    // Fix for the torch::zeros error by explicitly specifying the options using torch::TensorOptions.  
-    torch::Tensor trans = torch::zeros({2, 3}, torch::TensorOptions().dtype(torch::kFloat32).device(device));
-    trans[0][0] = scale_x;
-    trans[1][1] = scale_y;
+    float rot_rad = M_PI * rot / 180.0f;
+    std::vector<float> src_dir, dst_dir;
+    
+    if (src_w >= src_h) {
+        // Calculate direction vector based on rotation
+        src_dir = {
+            static_cast<float>(0.0f - std::sin(rot_rad) * src_w * 0.5f),
+            static_cast<float>(0.0f - std::cos(rot_rad) * src_w * 0.5f)
+        };
+        dst_dir = {0.0f, dst_w * -0.5f};
+    } else {
+        src_dir = {
+            static_cast<float>(std::cos(rot_rad) * src_h * 0.5f),
+            static_cast<float>(-std::sin(rot_rad) * src_h * 0.5f)
+        };
+        dst_dir = {dst_h * -0.5f, 0.0f};
+    }
+
+    // Setup source and destination points for affine transform
+    std::vector<cv::Point2f> src_pts(3);
+    std::vector<cv::Point2f> dst_pts(3);
+
+    // Point 1: center point
+    src_pts[0] = cv::Point2f(center[0] + scale_tmp[0] * shift[0], center[1] + scale_tmp[1] * shift[1]);
+    dst_pts[0] = cv::Point2f(dst_w * 0.5f, dst_h * 0.5f);
+
+    // Point 2: center + direction
+    src_pts[1] = cv::Point2f(center[0] + src_dir[0] + scale_tmp[0] * shift[0], 
+                            center[1] + src_dir[1] + scale_tmp[1] * shift[1]);
+    dst_pts[1] = cv::Point2f(dst_w * 0.5f + dst_dir[0], dst_h * 0.5f + dst_dir[1]);
+
+    // Point 3: get third point to form a triangle (similar to get_3rd_point in Python)
+    src_pts[2] = cv::Point2f(src_pts[0].x - src_pts[1].y + src_pts[0].y,
+                            src_pts[0].y + src_pts[1].x - src_pts[0].x);
+    dst_pts[2] = cv::Point2f(dst_pts[0].x - dst_pts[1].y + dst_pts[0].y,
+                            dst_pts[0].y + dst_pts[1].x - dst_pts[0].x);
+
+    // Use OpenCV's getAffineTransform (equivalent to Python's cv2.getAffineTransform)
+    cv::Mat trans_cv;
+    if (inv) {
+        trans_cv = cv::getAffineTransform(dst_pts, src_pts);
+    } else {
+        trans_cv = cv::getAffineTransform(src_pts, dst_pts);
+    }
+
+    std::cout << trans_cv << std::endl;
+
+    // Convert OpenCV Mat to torch::Tensor
+    torch::Tensor trans = torch::zeros({2, 3}, torch::kFloat32);
+    for (int i = 0; i < 2; i++) {
+        for (int j = 0; j < 3; j++) {
+            trans[i][j] = trans_cv.at<double>(i, j);
+        }
+    }
+
+    std::cout << trans << std::endl;
+
+    trans = trans.to(device);
+
     return trans;
 }
 
@@ -158,6 +239,181 @@ torch::Tensor project_point_cpp(torch::Tensor x, const torch::Tensor& R, const t
 torch::Tensor affine_transform_pts_cpp(torch::Tensor pts, torch::Tensor t);
 torch::Tensor project_grid_cpp(torch::Tensor grid, const std::vector<int>& ori_image_size_vec, const std::vector<int>& image_size_vec, const CameraParams& camera, int heatmap_w, int heatmap_h, int nbins, torch::Tensor resize_transform, torch::Device device);
 torch::Tensor load_and_preprocess_image(const std::string& image_path, const std::vector<int>& target_image_size, torch::Device device);
+
+// ------------- Visualization Code Start -------------
+
+// Define limb connections based on number of joints.
+// This is a placeholder. You should define it based on your dataset/model's joint definition.
+// Example for 17 COCO-style joints:
+const std::vector<std::pair<int, int>> LIMBS17 = {
+    {0, 1}, {0, 2}, {1, 3}, {2, 4},         // Head (Nose to L/R Eye, L/R Eye to L/R Ear)
+    {5, 6},                                 // Shoulders
+    {5, 7}, {7, 9},                         // Left Arm
+    {6, 8}, {8, 10},                        // Right Arm
+    {11, 12},                               // Hips
+    {5, 11}, {6, 12},                       // Torso
+    {11, 13}, {13, 15},                     // Left Leg
+    {12, 14}, {14, 16}                      // Right Leg
+};
+
+const std::vector<std::pair<int, int>> LIMBS15 = {
+    {0, 1}, {0, 2}, {0, 3}, {3, 4}, {4, 5}, 
+    {0, 9}, {9, 10}, {10, 11}, {2, 6}, {2, 12}, 
+    {6, 7}, {7, 8}, {12, 13}, {13, 14}
+};
+
+std::vector<std::pair<int, int>> get_limbs_definition(int num_joints) {
+    if (num_joints == 17) {
+        return LIMBS17;
+    } else if (num_joints == 15) {
+        return LIMBS15;
+    }
+    std::cerr << "Warning: Limb definition for " << num_joints << " joints not found. Returning empty limbs." << std::endl;
+    return {};
+}
+
+// Define a simple color palette (BGR format for OpenCV)
+const std::vector<cv::Scalar> VIS_COLORS = {
+    cv::Scalar(255, 0, 0),   // Blue
+    cv::Scalar(0, 255, 0),   // Green
+    cv::Scalar(0, 0, 255),   // Red
+    cv::Scalar(255, 255, 0), // Cyan
+    cv::Scalar(255, 0, 255), // Magenta
+    cv::Scalar(0, 255, 255), // Yellow
+};
+
+bool is_valid_coord_cpp(const torch::Tensor& pt, int width, int height) {
+    float x = pt[0].item<float>();
+    float y = pt[1].item<float>();
+    return x >= 0 && x < width && y >= 0 && y < height;
+}
+
+// Project a set of 3D joints to 2D image plane
+// poses_3d_person: (NumJoints, 3) tensor
+// Returns: (NumJoints, 2) tensor
+torch::Tensor project_pose_cpp(
+    const torch::Tensor& poses_3d_person,
+    const CameraParams& camera) {
+    
+    // 直接将整个关节点张量传入，批量处理所有关节点
+    // poses_3d_person 形状为 (NumJoints, 3)
+    return project_point_cpp(
+        poses_3d_person, camera.R, camera.T, camera.f, camera.c, camera.k_dist, camera.p_dist);
+}
+
+
+void save_image_with_poses_cpp(
+    const std::string& output_prefix_str,
+    const torch::Tensor& image_tensor_chw, // (Channels, Height, Width), RGB, float (model input)
+    const torch::Tensor& poses_3d,         // (1, MaxPeople, NumJoints, 5 for x,y,z,score,visibility_or_similar)
+    const CameraParams& camera_params,
+    const torch::Tensor& resize_transform, // 2x3 affine transform matrix
+    int view_idx,
+    float min_pose_score,
+    const std::vector<std::pair<int, int>>& limbs,
+    const std::vector<int>& original_image_size // {ori_w, ori_h} for un-doing normalization if needed or context
+) {
+    fs::path output_prefix(output_prefix_str);
+    fs::path dirname = output_prefix.parent_path() / "image_with_poses";
+    if (!fs::exists(dirname)) {
+        fs::create_directories(dirname);
+    }
+    std::string full_prefix = (dirname / output_prefix.filename()).string();
+    std::string file_name = full_prefix + "_view_" + std::to_string(view_idx + 1) + ".jpg";
+
+    // --- Image Tensor Preparation ---
+    // image_tensor_chw is (C, H, W), RGB, float, normalized for model input
+    // Based on Python: make_grid(normalize=True) -> then mul(255).clamp().byte().permute()
+    // normalize=True in make_grid shifts to [0,1] range.
+    
+    torch::Tensor vis_img_tensor = image_tensor_chw.clone();
+
+    // Denormalize from model input (example for standard ImageNet mean/std)
+    // This step is crucial if you want to see images that are not just the normalized ones.
+    // If load_and_preprocess_image applies normalization, we should approximately reverse it.
+    torch::Tensor mean = torch::tensor({0.485, 0.456, 0.406}, vis_img_tensor.options()).view({3, 1, 1});
+    torch::Tensor std_dev = torch::tensor({0.229, 0.224, 0.225}, vis_img_tensor.options()).view({3, 1, 1});
+    vis_img_tensor = vis_img_tensor * std_dev + mean;
+    
+    vis_img_tensor = vis_img_tensor.mul(255.0f).clamp(0.0f, 255.0f).to(torch::kU8);
+    vis_img_tensor = vis_img_tensor.permute({1, 2, 0}).cpu().contiguous(); // CHW -> HWC
+
+    int img_h = vis_img_tensor.size(0);
+    int img_w = vis_img_tensor.size(1);
+    int channels = vis_img_tensor.size(2);
+
+    cv::Mat vis_mat;
+    if (channels == 3) {
+        vis_mat = cv::Mat(img_h, img_w, CV_8UC3, vis_img_tensor.data_ptr<uint8_t>());
+        cv::cvtColor(vis_mat, vis_mat, cv::COLOR_RGB2BGR); // Convert RGB to BGR for OpenCV
+    } else if (channels == 1) {
+        vis_mat = cv::Mat(img_h, img_w, CV_8UC1, vis_img_tensor.data_ptr<uint8_t>());
+    } else {
+        std::cerr << "Unsupported channel count for visualization: " << channels << std::endl;
+        return;
+    }
+    cv::Mat output_display = vis_mat.clone(); // Work on a copy
+
+    // --- Poses Processing ---
+    // poses_3d shape is (Batch=1, MaxPeople, NumJoints, 5)
+    // Last dim: 0:x, 1:y, 2:z, 3:score, 4:visibility (assumption, Python used poses[...,0,4] for score)
+    
+    if (poses_3d.size(0) == 0) return; // No poses to draw
+
+    auto poses_cpu = poses_3d.cpu();
+    auto poses_accessor = poses_cpu.accessor<float, 4>(); // B, P, J, Dims
+    int max_people = poses_3d.size(1);
+    int num_joints = poses_3d.size(2);
+
+    for (int p = 0; p < max_people; ++p) {
+        // Use score of a prominent joint (e.g., joint 0) or a dedicated person score if available
+        // Python code: poses[i, n, 0, 4] < config.CAPTURE_SPEC.MIN_SCORE
+        // Assuming index 3 for score here based on typical (x,y,z,score) or 4 if (x,y,z,score_joint,vis_person_score)
+        float person_score = (num_joints > 0 && poses_3d.size(3) > 3) ? poses_accessor[0][p][0][3] : 0.0f; // Example: score of joint 0
+        if (poses_3d.size(3) > 4) { // If 5th element exists, use it as per Python's poses[i,n,0,4]
+             person_score = poses_accessor[0][p][0][4];
+        }
+
+
+        if (person_score < min_pose_score) {
+            continue;
+        }
+
+        cv::Scalar color = VIS_COLORS[p % VIS_COLORS.size()];
+
+        torch::Tensor current_pose_3d_pts = poses_3d.select(0,0).select(0,p).slice(1,0,3).contiguous(); // (NumJoints, 3)
+        
+        torch::Tensor pose_2d_projected = project_pose_cpp(current_pose_3d_pts, camera_params); // (NumJoints, 2)
+        torch::Tensor pose_2d_transformed = affine_transform_pts_cpp(pose_2d_projected, resize_transform); // (NumJoints, 2)
+        
+        // Draw joints
+        for (int j = 0; j < num_joints; ++j) {
+            torch::Tensor pt_tensor = pose_2d_transformed[j];
+            if (is_valid_coord_cpp(pt_tensor, img_w, img_h)) {
+                cv::Point center(static_cast<int>(pt_tensor[0].item<float>()), static_cast<int>(pt_tensor[1].item<float>()));
+                cv::circle(output_display, center, 4, color, -1); // Radius 4
+            }
+        }
+
+        // Draw limbs
+        for (const auto& limb : limbs) {
+            if (limb.first >= num_joints || limb.second >= num_joints) continue;
+
+            torch::Tensor p1_tensor = pose_2d_transformed[limb.first];
+            torch::Tensor p2_tensor = pose_2d_transformed[limb.second];
+
+            if (is_valid_coord_cpp(p1_tensor, img_w, img_h) && is_valid_coord_cpp(p2_tensor, img_w, img_h)) {
+                cv::Point p1(static_cast<int>(p1_tensor[0].item<float>()), static_cast<int>(p1_tensor[1].item<float>()));
+                cv::Point p2(static_cast<int>(p2_tensor[0].item<float>()), static_cast<int>(p2_tensor[1].item<float>()));
+                cv::line(output_display, p1, p2, color, 2); // Thickness 2
+            }
+        }
+    }
+    cv::imwrite(file_name, output_display);
+    // std::cout << "Saved visualization to " << file_name << std::endl;
+}
+
+// ------------- Visualization Code End -------------
 
 int main(int argc, const char* argv[]) {
     if (argc < 6) { // Prog_name, backbone, model, calib.json, image_base_dir, device
@@ -380,6 +636,38 @@ int main(int argc, const char* argv[]) {
             auto overall_frame_duration = std::chrono::duration_cast<std::chrono::milliseconds>(overall_frame_end_time - overall_frame_start_time);
             total_duration_ms += overall_frame_duration.count();
             frames_processed_for_fps++;
+        }
+
+        // --- Visualization Call (example: save every 20 frames after warmup) ---
+        if (frame_idx >= warmup_frames && frame_idx % 20 == 0) {
+            // fused_poses is assumed (1, MaxPeople, NumJoints, 5)
+            // batch_tensors contains NUM_CAMERAS tensors, each (1, C, H, W)
+            // These are the preprocessed images fed to the backbone.
+			// fused_poses = fused_poses.to(torch::kCPU); // Move to CPU for visualization
+            if (fused_poses.defined() && fused_poses.numel() > 0 && fused_poses.dim() == 4 && batch_tensors.size() == NUM_CAMERAS) {
+                int num_joints_from_pose = fused_poses.size(2);
+                std::vector<std::pair<int, int>> current_limbs = get_limbs_definition(num_joints_from_pose);
+
+                for (int view_idx = 0; view_idx < NUM_CAMERAS; ++view_idx) {
+                    std::string vis_output_prefix = "output_frame_" + std::to_string(frame_idx);
+                    // batch_tensors[view_idx] is (1, C, H, W). Squeeze to (C,H,W) for the function.
+                    // Or modify save_image_with_poses_cpp to take (B,C,H,W) and handle B internally if needed.
+                    // For now, assume B=1 for visualization.
+                    if (batch_tensors[view_idx].size(0) == 1) { // Ensure batch size is 1 for this image
+                         save_image_with_poses_cpp(
+                            vis_output_prefix,
+                            batch_tensors[view_idx].squeeze(0), // Pass (C,H,W)
+                            fused_poses,                        // Pass (1, MaxPeople, NumJoints, 5)
+                            cameras[view_idx],
+                            resize_transform_tensor,            // This is the 2x3 affine transform
+                            view_idx,
+                            0.2f,                               // Min pose score example
+                            current_limbs,
+                            ori_image_size_cfg                  // Pass original image size for context
+                        );
+                    }
+                }
+            }
         }
     }
 
