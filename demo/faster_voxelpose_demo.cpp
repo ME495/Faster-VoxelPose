@@ -10,6 +10,7 @@
 #include <filesystem> // For directory iteration (C++17)
 #include <algorithm> // For std::sort, std::min
 #include <iomanip>   // For std::fixed, std::setprecision
+#include <future>    // For std::async
 
 namespace fs = std::filesystem;
 using json = nlohmann::json;
@@ -299,17 +300,38 @@ int main(int argc, const char* argv[]) {
 
         auto frame_start_time = std::chrono::high_resolution_clock::now();
 
+        std::vector<std::future<torch::Tensor>> image_futures;
+        for (int cam_idx = 0; cam_idx < NUM_CAMERAS; ++cam_idx) {
+            image_futures.push_back(std::async(std::launch::async, load_and_preprocess_image, 
+                                    camera_image_files[cam_idx][frame_idx], image_size_cfg, device));
+        }
+
+        std::vector<torch::Tensor> batch_tensors;
+        bool has_error = false;
+        for (int cam_idx = 0; cam_idx < NUM_CAMERAS; ++cam_idx) {
+            torch::Tensor img_tensor = image_futures[cam_idx].get();
+            if (img_tensor.numel() == 0) {
+                std::cerr << "Skipping frame due to image load error for camera " << cam_idx << std::endl;
+                has_error = true;
+                break;
+            }
+            batch_tensors.push_back(img_tensor);
+        }
+
+        if (has_error || batch_tensors.size() != NUM_CAMERAS) {
+            std::cerr << "Error: Not enough images loaded for frame " << frame_idx << std::endl;
+            continue;
+        }
+
+        torch::Tensor batch_input = torch::cat(batch_tensors, 0);  // [NUM_CAMERAS, 3, H, W]
+        torch::Tensor batch_heatmaps = backbone_module.forward({batch_input}).toTensor();
+        
         std::vector<torch::Tensor> current_frame_heatmaps_list;
         for (int cam_idx = 0; cam_idx < NUM_CAMERAS; ++cam_idx) {
-            torch::Tensor input_tensor = load_and_preprocess_image(camera_image_files[cam_idx][frame_idx], image_size_cfg, device);
-            if (input_tensor.numel() == 0) { std::cerr << "Skipping frame due to image load error." << std::endl; continue; }
-            torch::Tensor heatmaps_view = backbone_module.forward({input_tensor}).toTensor();
-            current_frame_heatmaps_list.push_back(heatmaps_view);
+            current_frame_heatmaps_list.push_back(batch_heatmaps[cam_idx].unsqueeze(0));
         }
+        
         std::cout << "current_frame_heatmaps_list: " << current_frame_heatmaps_list.size() << std::endl;
-        if(current_frame_heatmaps_list.size() != NUM_CAMERAS) { 
-            std::cerr << "Error: Not enough heatmaps generated for frame " << frame_idx << std::endl; continue; 
-        }
         torch::Tensor input_heatmaps_for_model = torch::cat(current_frame_heatmaps_list, 0).unsqueeze(0);
 
         std::vector<torch::jit::IValue> model_inputs;
