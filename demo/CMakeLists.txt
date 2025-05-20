@@ -1,11 +1,41 @@
 cmake_minimum_required(VERSION 3.10)
 project(FasterVoxelPoseDemo)
 
+# Set default build type to Release if not specified
+if(NOT CMAKE_BUILD_TYPE)
+  set(CMAKE_BUILD_TYPE Release CACHE STRING "Choose the type of build." FORCE)
+endif()
+
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED True)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON) # Ensure compile_commands.json is generated for IDEs
 
-set(CMAKE_BUILD_TYPE "Debug")
+# Add compiler optimization flags based on build type
+if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+  # For GCC and Clang
+  set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -O0 -g")
+  set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -O3 -DNDEBUG")
+  set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "${CMAKE_CXX_FLAGS_RELWITHDEBINFO} -O2 -g -DNDEBUG")
+  set(CMAKE_CXX_FLAGS_MINSIZEREL "${CMAKE_CXX_FLAGS_MINSIZEREL} -Os -DNDEBUG")
+elseif(MSVC)
+  # For MSVC
+  set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} /Od /Zi")
+  set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} /O2 /Ob2 /DNDEBUG")
+  set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "${CMAKE_CXX_FLAGS_RELWITHDEBINFO} /O2 /Zi /DNDEBUG")
+  set(CMAKE_CXX_FLAGS_MINSIZEREL "${CMAKE_CXX_FLAGS_MINSIZEREL} /O1 /DNDEBUG")
+endif()
+
+# Enable link-time optimization for Release builds
+if(NOT CMAKE_BUILD_TYPE STREQUAL "Debug")
+  include(CheckIPOSupported)
+  check_ipo_supported(RESULT LTO_SUPPORTED OUTPUT LTO_CHECK_OUTPUT)
+  if(LTO_SUPPORTED)
+    message(STATUS "IPO / LTO enabled")
+    set(CMAKE_INTERPROCEDURAL_OPTIMIZATION TRUE)
+  else()
+    message(STATUS "IPO / LTO not supported: ${LTO_CHECK_OUTPUT}")
+  endif()
+endif()
 
 # 源文件
 set(SOURCES
@@ -58,14 +88,25 @@ target_link_libraries(faster_voxelpose_demo
 
 set_property(TARGET faster_voxelpose_demo PROPERTY CXX_STANDARD 17)
 
+# Apply link-time optimization to the target if supported
+if(LTO_SUPPORTED AND NOT CMAKE_BUILD_TYPE STREQUAL "Debug")
+  set_property(TARGET faster_voxelpose_demo PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
+endif()
+
 if (MSVC)
   # For Windows, need to copy Torch DLLs to the executable directory for execution
   # or ensure they are in the PATH.
   # This example does not automate DLL copying.
+  
+  # Enable multi-core compilation for MSVC
+  target_compile_options(faster_voxelpose_demo PRIVATE /MP)
 endif()
 
+message(STATUS "Build type: ${CMAKE_BUILD_TYPE}")
+message(STATUS "C++ flags: ${CMAKE_CXX_FLAGS}")
+message(STATUS "C++ Release flags: ${CMAKE_CXX_FLAGS_RELEASE}")
 message(STATUS "LibTorch libraries: ${TORCH_LIBRARIES}")
 message(STATUS "OpenCV libraries: ${OpenCV_LIBS}")
 message(STATUS "Torch include dirs: ${TORCH_INCLUDE_DIRS}")
 message(STATUS "OpenCV include dirs: ${OpenCV_INCLUDE_DIRS}")
-message(STATUS "nlohmann_json include dir: ${nlohmann_json_SOURCE_DIR}/include") 
+message(STATUS "nlohmann_json include dir: ${nlohmann_json_SOURCE_DIR}/include")
