@@ -23,28 +23,29 @@ torch::Tensor project_point_cpp(torch::Tensor x,
                               const torch::Tensor& R, const torch::Tensor& T, 
                               const torch::Tensor& f, const torch::Tensor& c, 
                               const torch::Tensor& k_dist, const torch::Tensor& p_dist) {
-    torch::Tensor x_minus_T = x.transpose(0, 1) - T;
-    torch::Tensor xcam = torch::mm(R, x_minus_T);
-    torch::Tensor y = xcam.slice(0, 0, 2) / (xcam.slice(0, 2, 3) + 1e-5);
-    torch::Tensor r_sq = torch::sum(y * y, 0);
+    // 假设x为[N, 3]，每行为一个点
+    torch::Tensor x_minus_T = x - T.squeeze(); // T shape: [3] or [3,1]
+    torch::Tensor xcam = torch::matmul(x_minus_T, R.t()); // [N,3] x [3,3] -> [N,3]
+    torch::Tensor y = xcam.slice(1, 0, 2) / (xcam.slice(1, 2, 3) + 1e-5); // [N,2] / [N,1]
+    torch::Tensor r_sq = torch::sum(y * y, 1, true); // [N,1]
     torch::Tensor d_radial = 1.0f + k_dist[0] * r_sq + k_dist[1] * r_sq * r_sq + k_dist[2] * r_sq * r_sq * r_sq;
-    torch::Tensor y0 = y.slice(0, 0, 1);
-    torch::Tensor y1 = y.slice(0, 1, 2);
+    torch::Tensor y0 = y.slice(1, 0, 1); // [N,1]
+    torch::Tensor y1 = y.slice(1, 1, 2); // [N,1]
     torch::Tensor u_tangential = 2 * p_dist[0] * y0 * y1 + p_dist[1] * (r_sq + 2 * y0 * y0);
     torch::Tensor v_tangential = 2 * p_dist[1] * y0 * y1 + p_dist[0] * (r_sq + 2 * y1 * y1);
     torch::Tensor u = y0 * d_radial + u_tangential;
     torch::Tensor v = y1 * d_radial + v_tangential;
-    torch::Tensor y_distorted = torch::cat({u, v}, 0);
-    torch::Tensor ypixel = f * y_distorted + c;
-    return ypixel.transpose(0, 1);
+    torch::Tensor y_distorted = torch::cat({u, v}, 1).contiguous(); // [N,2]
+    torch::Tensor ypixel = f.squeeze() * y_distorted + c.squeeze(); // [2] * [N,2] + [2] => [N,2]
+    return ypixel;
 }
 
 torch::Tensor affine_transform_pts_cpp(torch::Tensor pts, torch::Tensor t) {
     int64_t npts = pts.size(0);
     torch::Tensor ones = torch::ones({npts, 1}, pts.options());
-    torch::Tensor pts_homo = torch::cat({pts, ones}, 1);
-    torch::Tensor out_homo = torch::mm(t, pts_homo.transpose(0, 1)); 
-    return out_homo.slice(0,0,2).transpose(0,1);
+    torch::Tensor pts_homo = torch::cat({pts, ones}, 1).contiguous();
+    torch::Tensor out_homo = torch::mm(pts_homo, t.t());
+    return out_homo.slice(1,0,2);
 }
 
 torch::Tensor project_grid_cpp(torch::Tensor grid, 
@@ -64,7 +65,7 @@ torch::Tensor project_grid_cpp(torch::Tensor grid,
     xy = xy * wh_heatmap / wh_image_size;
     torch::Tensor wh_minus_1 = torch::tensor({static_cast<float>(heatmap_w - 1), static_cast<float>(heatmap_h - 1)}, device);
     torch::Tensor sample_grid_normalized = (xy / wh_minus_1) * 2.0f - 1.0f;
-    sample_grid_normalized = sample_grid_normalized.view({1, 1, nbins, 2}); // grid_sample兼容格式
+    sample_grid_normalized = sample_grid_normalized.contiguous().view({1, 1, nbins, 2});
     sample_grid_normalized = torch::clamp(sample_grid_normalized, -1.1f, 1.1f);
     return sample_grid_normalized;
 }
