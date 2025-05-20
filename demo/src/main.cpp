@@ -105,6 +105,9 @@ int main(int argc, const char* argv[]) {
     try {
         backbone_module = torch::jit::load(backbone_path, device);
         backbone_module.eval();
+        // 转换backbone模型到半精度
+        backbone_module.to(torch::kHalf);
+        
         model_module = torch::jit::load(model_path, device);
         model_module.eval();
     } catch (const c10::Error& e) {
@@ -204,7 +207,18 @@ int main(int argc, const char* argv[]) {
         auto heatmap_extraction_start_time = std::chrono::high_resolution_clock::now();
 
         torch::Tensor batch_input = torch::cat(batch_tensors, 0);  // [NUM_CAMERAS, 3, H, W]
-        torch::Tensor batch_heatmaps = backbone_module.forward({batch_input}).toTensor().unsqueeze(0);
+        
+        // 将输入转换为半精度
+        batch_input = batch_input.to(torch::kHalf);
+        
+        // 使用半精度进行前向推理
+        torch::Tensor batch_heatmaps = backbone_module.forward({batch_input}).toTensor();
+        
+        // 将输出转回全精度供后续处理
+        batch_heatmaps = batch_heatmaps.to(torch::kFloat);
+        
+        // 添加批次维度
+        batch_heatmaps = batch_heatmaps.unsqueeze(0);
         
         auto heatmap_extraction_end_time = std::chrono::high_resolution_clock::now();
         if (device_type == torch::kCUDA) {
