@@ -7,6 +7,8 @@
 #include <future>
 #include <algorithm>
 #include <iomanip>
+#include <ATen/ATen.h>
+#include <ATen/cudnn/Handle.h>
 
 #include "types.h"
 #include "camera.h"
@@ -43,11 +45,23 @@ int main(int argc, const char* argv[]) {
     if (device_str == "cuda" && torch::cuda::is_available()) {
         device_type = torch::kCUDA;
         std::cout << "使用CUDA设备." << std::endl;
+        // // 设置cudnn参数（仅在CUDA下有效）
+        // torch::globalContext().setBenchmarkCuDNN(true);
+        // torch::globalContext().setDeterministicCuDNN(false);
+        // std::cout << "已开启cuDNN benchmark, 关闭deterministic." << std::endl;
     } else {
         device_type = torch::kCPU;
         std::cout << "使用CPU设备." << std::endl;
     }
     torch::Device device(device_type);
+
+    // 设置torch线程数（可根据实际CPU核心数调整）
+    int num_threads = std::thread::hardware_concurrency();
+    if (num_threads > 8) {
+        torch::set_num_threads(8);
+        torch::set_num_interop_threads(8);
+        std::cout << "已设置torch线程数: " << 8 << std::endl;
+    }
 
     // --- 配置参数 (来自configs/custom/jln64.yaml) --- 
     std::vector<int> ori_image_size_cfg = {2048, 1544};      
