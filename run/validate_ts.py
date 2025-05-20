@@ -214,9 +214,10 @@ def main():
                     input_heatmaps = scripted_backbone(inputs.view(-1, 3, inputs.shape[3], inputs.shape[4]))
                     input_heatmaps = input_heatmaps.view(-1, config.DATASET.CAMERA_NUM, input_heatmaps.shape[1], input_heatmaps.shape[2], input_heatmaps.shape[3])
                     sample_grids = [sample_grids_dict[meta['seq'][j]] for j in range(input_heatmaps.shape[0])]
-                    sample_grids = torch.cat(sample_grids, dim=0)
+                    sample_grids = torch.stack(sample_grids, dim=0)
                     fine_sample_grids = [fine_sample_grids_dict[meta['seq'][j]] for j in range(input_heatmaps.shape[0])]
-                    fine_sample_grids = torch.cat(fine_sample_grids, dim=0)
+                    fine_sample_grids = torch.stack(fine_sample_grids, dim=0)
+                    # print(input_heatmaps.shape, sample_grids.shape, fine_sample_grids.shape)
                     fused_poses = scripted_model(input_heatmaps, sample_grids, fine_sample_grids)
             else:
                 raise ValueError('test heatmap source must be image!')

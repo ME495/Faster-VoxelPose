@@ -204,7 +204,7 @@ class ProjectLayerTS(nn.Module):
             end_y = end[i, 1].item()
             end_z = end[i, 2].item()
             
-            sample_grid = fine_sample_grids[:, start_x:end_x, start_y:end_y, start_z:end_z].reshape(n, 1, -1, 2)
+            sample_grid = fine_sample_grids[index, :, start_x:end_x, start_y:end_y, start_z:end_z].reshape(n, 1, -1, 2)
 
             # 使用grid_sample从多视角热图中采样特征，然后取平均
             accu_cubes = torch.mean(F.grid_sample(heatmaps[index], sample_grid, align_corners=True), dim=0)
