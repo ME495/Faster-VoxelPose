@@ -9,6 +9,11 @@
 #include <iomanip>
 #include <ATen/ATen.h>
 #include <ATen/cudnn/Handle.h>
+#include <queue>
+#include <mutex>
+#include <condition_variable>
+#include <thread>
+#include <opencv2/opencv.hpp>
 
 #include "types.h"
 #include "camera.h"
@@ -167,7 +172,56 @@ int main(int argc, const char* argv[]) {
     torch::Tensor final_sample_grid_fine = torch::stack(sample_grids_fine_list_static, 0).unsqueeze(0);
     // --- 预计算网格结束 ---
 
-    // 处理循环
+    // --- 线程安全队列和同步变量 ---
+    std::queue<std::vector<cv::Mat>> image_queue;
+    std::mutex queue_mutex;
+    std::condition_variable queue_cv;
+    bool finished = false;
+    bool image_error = false;
+
+    // --- 图片读取线程函数 ---
+    auto image_loader_thread_func = [&](int frames_to_run) {
+        for (int frame_idx = 0; frame_idx < frames_to_run; ++frame_idx) {
+            std::vector<cv::Mat> batch_images;
+            bool has_error = false;
+            // 并行读取所有相机图片
+            std::vector<std::future<cv::Mat>> image_futures;
+            for (int cam_idx = 0; cam_idx < NUM_CAMERAS; ++cam_idx) {
+                image_futures.push_back(std::async(std::launch::async, load_and_preprocess_image,
+                    camera_image_files[cam_idx][frame_idx], image_size_cfg));
+            }
+            for (int cam_idx = 0; cam_idx < NUM_CAMERAS; ++cam_idx) {
+                cv::Mat norm_img = image_futures[cam_idx].get();
+                if (norm_img.empty()) {
+                    std::cerr << "由于相机 " << cam_idx << " 的图像加载错误，跳过帧处理" << std::endl;
+                    has_error = true;
+                    break;
+                }
+                batch_images.push_back(norm_img);
+            }
+            {
+                std::unique_lock<std::mutex> lock(queue_mutex);
+                // 如果队列元素大于10则等待，避免消耗过多内存
+                queue_cv.wait(lock, [&]{ return image_queue.size() <= 10; });
+                if (has_error || batch_images.size() != NUM_CAMERAS) {
+                    image_error = true;
+                    break;
+                }
+                image_queue.push(std::move(batch_images));
+                queue_cv.notify_one();
+            }
+        }
+        {
+            std::lock_guard<std::mutex> lock(queue_mutex);
+            finished = true;
+        }
+        queue_cv.notify_all();
+    };
+
+    // 启动图片读取线程
+    std::thread image_loader_thread(image_loader_thread_func, frames_to_run);
+
+    // --- 处理循环 ---
     torch::NoGradGuard no_grad;
     long long total_duration_ms = 0;
     long long total_image_processing_ms = 0;
@@ -185,128 +239,116 @@ int main(int argc, const char* argv[]) {
 
         auto overall_frame_start_time = std::chrono::high_resolution_clock::now();
 
-        // --- 1. 图像处理 ---
+        // --- 1. 从队列获取图片张量 ---
         auto image_processing_start_time = std::chrono::high_resolution_clock::now();
-
-        std::vector<std::future<torch::Tensor>> image_futures;
-        for (int cam_idx = 0; cam_idx < NUM_CAMERAS; ++cam_idx) {
-            image_futures.push_back(std::async(std::launch::async, load_and_preprocess_image, 
-                                    camera_image_files[cam_idx][frame_idx], image_size_cfg, device));
-        }
-
         std::vector<torch::Tensor> batch_tensors;
-        bool has_error = false;
-        for (int cam_idx = 0; cam_idx < NUM_CAMERAS; ++cam_idx) {
-            torch::Tensor img_tensor = image_futures[cam_idx].get();
-            if (img_tensor.numel() == 0) {
-                std::cerr << "由于相机 " << cam_idx << " 的图像加载错误，跳过帧处理" << std::endl;
-                has_error = true;
+        std::vector<cv::Mat> batch_images;
+        {
+            std::unique_lock<std::mutex> lock(queue_mutex);
+            queue_cv.wait(lock, [&]{ return !image_queue.empty() || finished || image_error; });
+            if (image_error) {
+                std::cerr << "图片读取线程发生错误，终止主循环。" << std::endl;
                 break;
             }
-            batch_tensors.push_back(img_tensor);
+            if (!image_queue.empty()) {
+                batch_images = std::move(image_queue.front());
+                image_queue.pop();
+                queue_cv.notify_one();
+            } else if (finished) {
+                break;
+            }
         }
-
-        if (has_error || batch_tensors.size() != NUM_CAMERAS) {
+        if (batch_images.size() != NUM_CAMERAS) {
             std::cerr << "错误: 为帧 " << frame_idx << " 加载的图像不足" << std::endl;
             continue;
         }
-
         auto image_processing_end_time = std::chrono::high_resolution_clock::now();
-        if (device_type == torch::kCUDA) { // 确保所有可能的to(device)操作完成
+        if (device_type == torch::kCUDA) {
             torch::cuda::synchronize();
-            image_processing_end_time = std::chrono::high_resolution_clock::now(); // 重新获取时间
+            image_processing_end_time = std::chrono::high_resolution_clock::now();
         }
 
         // --- 2. Heatmap提取 ---
+        // 主线程将cv::Mat转为Tensor
+        for (int cam_idx = 0; cam_idx < NUM_CAMERAS; ++cam_idx) {
+            const cv::Mat& norm_img = batch_images[cam_idx];
+            torch::Tensor img_tensor = torch::from_blob(
+                norm_img.data,
+                {norm_img.rows, norm_img.cols, 3},
+                torch::kFloat32
+            ).clone().permute({2, 0, 1}).unsqueeze(0).to(device);
+            batch_tensors.push_back(img_tensor);
+        }
+        
         auto heatmap_extraction_start_time = std::chrono::high_resolution_clock::now();
-
         torch::Tensor batch_input = torch::cat(batch_tensors, 0);  // [NUM_CAMERAS, 3, H, W]
-        
-        // 将输入转换为半精度
         batch_input = batch_input.to(torch::kHalf);
-        
-        // 使用半精度进行前向推理
         torch::Tensor batch_heatmaps = backbone_module.forward({batch_input}).toTensor();
-        
-        // 将输出转回全精度供后续处理
         batch_heatmaps = batch_heatmaps.to(torch::kFloat);
-        
-        // 添加批次维度
         batch_heatmaps = batch_heatmaps.unsqueeze(0);
-        
         auto heatmap_extraction_end_time = std::chrono::high_resolution_clock::now();
         if (device_type == torch::kCUDA) {
             torch::cuda::synchronize();
-            heatmap_extraction_end_time = std::chrono::high_resolution_clock::now(); // 重新获取时间
+            heatmap_extraction_end_time = std::chrono::high_resolution_clock::now();
         }
 
         // --- 3. 姿态估计 ---
         auto pose_estimation_start_time = std::chrono::high_resolution_clock::now();
-
         std::vector<torch::jit::IValue> model_inputs;
         model_inputs.push_back(batch_heatmaps);
         model_inputs.push_back(final_sample_grid_coarse); 
         model_inputs.push_back(final_sample_grid_fine);
-
         torch::Tensor fused_poses = model_module.forward(model_inputs).toTensor();
-        
         auto pose_estimation_end_time = std::chrono::high_resolution_clock::now();
         if (device_type == torch::kCUDA) {
             torch::cuda::synchronize(); 
-            pose_estimation_end_time = std::chrono::high_resolution_clock::now(); // 重新获取时间
+            pose_estimation_end_time = std::chrono::high_resolution_clock::now();
         }
-
         auto overall_frame_end_time = std::chrono::high_resolution_clock::now();
-        
         // 计时统计
-        if (frame_idx >= warmup_frames) { // 热身后开始计时
+        if (frame_idx >= warmup_frames) {
             auto image_processing_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
                 image_processing_end_time - image_processing_start_time);
             total_image_processing_ms += image_processing_duration.count();
-
             auto heatmap_extraction_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
                 heatmap_extraction_end_time - heatmap_extraction_start_time);
             total_heatmap_extraction_ms += heatmap_extraction_duration.count();
-
             auto pose_estimation_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
                 pose_estimation_end_time - pose_estimation_start_time);
             total_pose_estimation_ms += pose_estimation_duration.count();
-            
             auto overall_frame_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
                 overall_frame_end_time - overall_frame_start_time);
             total_duration_ms += overall_frame_duration.count();
             frames_processed_for_fps++;
         }
-
-        // --- 可视化（示例：热身后每20帧保存一次）---
-        if (frame_idx >= warmup_frames && frame_idx % 20 == 0) {
-            // fused_poses形状为(1, MaxPeople, NumJoints, 5)
-            // batch_tensors包含NUM_CAMERAS个张量，每个形状为(1, C, H, W)
-            if (fused_poses.defined() && fused_poses.numel() > 0 && 
-                fused_poses.dim() == 4 && batch_tensors.size() == NUM_CAMERAS) {
-                
-                int num_joints_from_pose = fused_poses.size(2);
-                std::vector<std::pair<int, int>> current_limbs = get_limbs_definition(num_joints_from_pose);
-
-                for (int view_idx = 0; view_idx < NUM_CAMERAS; ++view_idx) {
-                    std::string vis_output_prefix = "output_frame_" + std::to_string(frame_idx);
-                    // batch_tensors[view_idx]形状为(1, C, H, W)，使用squeeze移除批次维度
-                    if (batch_tensors[view_idx].size(0) == 1) { // 确保图像批次维度为1
-                         save_image_with_poses_cpp(
-                            vis_output_prefix,
-                            batch_tensors[view_idx].squeeze(0), // 传递(C,H,W)
-                            fused_poses,                        // 传递(1, MaxPeople, NumJoints, 5)
-                            cameras[view_idx],
-                            resize_transform_tensor,            // 2x3仿射变换矩阵
-                            view_idx,
-                            0.2f,                               // 最小姿态分数示例
-                            current_limbs,
-                            ori_image_size_cfg                  // 传递原始图像大小
-                        );
-                    }
-                }
-            }
-        }
+        // // --- 可视化（示例：热身后每20帧保存一次）---
+        // if (frame_idx >= warmup_frames && frame_idx % 20 == 0) {
+        //     if (fused_poses.defined() && fused_poses.numel() > 0 && 
+        //         fused_poses.dim() == 4 && batch_tensors.size() == NUM_CAMERAS) {
+        //         int num_joints_from_pose = fused_poses.size(2);
+        //         std::vector<std::pair<int, int>> current_limbs = get_limbs_definition(num_joints_from_pose);
+        //         for (int view_idx = 0; view_idx < NUM_CAMERAS; ++view_idx) {
+        //             std::string vis_output_prefix = "output_frame_" + std::to_string(frame_idx);
+        //             if (batch_tensors[view_idx].size(0) == 1) {
+        //                  save_image_with_poses_cpp(
+        //                     vis_output_prefix,
+        //                     batch_tensors[view_idx].squeeze(0),
+        //                     fused_poses,
+        //                     cameras[view_idx],
+        //                     resize_transform_tensor,
+        //                     view_idx,
+        //                     0.2f,
+        //                     current_limbs,
+        //                     ori_image_size_cfg
+        //                 );
+        //             }
+        //         }
+        //     }
+        // }
+    }
+    // 等待图片读取线程结束
+    if (image_loader_thread.joinable()) {
+        image_loader_thread.join();
     }
 
     // 输出性能统计信息
