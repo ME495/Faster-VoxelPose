@@ -325,14 +325,7 @@ int main(int argc, const char* argv[]) {
 
         torch::Tensor batch_input = torch::cat(batch_tensors, 0);  // [NUM_CAMERAS, 3, H, W]
         torch::Tensor batch_heatmaps = backbone_module.forward({batch_input}).toTensor();
-        
-        std::vector<torch::Tensor> current_frame_heatmaps_list;
-        for (int cam_idx = 0; cam_idx < NUM_CAMERAS; ++cam_idx) {
-            current_frame_heatmaps_list.push_back(batch_heatmaps[cam_idx].unsqueeze(0));
-        }
-        
-        std::cout << "current_frame_heatmaps_list: " << current_frame_heatmaps_list.size() << std::endl;
-        torch::Tensor input_heatmaps_for_model = torch::cat(current_frame_heatmaps_list, 0).unsqueeze(0);
+        torch::Tensor input_heatmaps_for_model = torch::cat(batch_heatmaps, 0).unsqueeze(0); // [1, NUM_CAMERAS, 3, H, W]
 
         std::vector<torch::jit::IValue> model_inputs;
         model_inputs.push_back(input_heatmaps_for_model);
