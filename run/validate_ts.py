@@ -26,7 +26,6 @@ from utils.cameras import project_pose
 from utils.transforms import affine_transform_pts_cuda as do_transform
 
 import dataset
-import models
 
 
 def parse_args():
@@ -144,29 +143,23 @@ def main():
     torch.backends.cudnn.deterministic = config.CUDNN.DETERMINISTIC
     torch.backends.cudnn.enabled = config.CUDNN.ENABLED
     
-    model = models.faster_voxelpose_ts.FasterVoxelPoseNetTS(config)
+    # --- Load Scripted Backbone ---
+    scripted_backbone_path = os.path.join(final_output_dir, "scripted_backbone.pt")
+    if not os.path.isfile(scripted_backbone_path):
+        raise ValueError(f"Scripted backbone not found at {scripted_backbone_path}. Please run export.py first.")
+    print(f'=> loading scripted backbone from {scripted_backbone_path}')
+    scripted_backbone = torch.jit.load(scripted_backbone_path, map_location=config.DEVICE)
+    scripted_backbone.eval() # Ensure it's in eval mode
 
-    if config.NETWORK.PRETRAINED_BACKBONE:
-        backbone = eval('models.' + config.BACKBONE + '.get')(config)
-        print('=> loading weights of the backbone')
-        backbone.load_state_dict(torch.load(config.NETWORK.PRETRAINED_BACKBONE))
-        backbone.eval()   # freeze the backbone
-        scripted_backbone = torch.jit.script(backbone)
-        scripted_backbone = scripted_backbone.to(config.DEVICE)
-    else:
-        raise ValueError('pretrained backbone must be specified!')
+    # --- Load Scripted Main Model ---
+    scripted_model_path = os.path.join(final_output_dir, "scripted_faster_voxelpose_ts.pt")
+    if not os.path.isfile(scripted_model_path):
+        raise ValueError(f"Scripted model not found at {scripted_model_path}. Please run export.py first.")
+    print(f"=> loading scripted main model from {scripted_model_path}")
+    scripted_model = torch.jit.load(scripted_model_path, map_location=config.DEVICE)
+    scripted_model.eval() # Ensure it's in eval mode
 
-    test_model_file = os.path.join(final_output_dir, config.TEST.MODEL_FILE)
-    if config.TEST.MODEL_FILE and os.path.isfile(test_model_file):
-        logger.info('=> load model state {}'.format(test_model_file))
-        model.load_state_dict(torch.load(test_model_file), strict=False)
-    else:
-        raise ValueError('check model file for testing!')
-
-    print("=> validating...")
-    model.eval()
-    scripted_model = torch.jit.script(model)
-    scripted_model = scripted_model.to(config.DEVICE)
+    print("=> validating with pre-exported TorchScript models...")
 
     # loading constants of the dataset
     cameras = test_loader.dataset.cameras
@@ -217,7 +210,7 @@ def main():
             if config.DATASET.TEST_HEATMAP_SRC == 'image':
                 inputs = inputs.to(config.DEVICE)
                 
-                with torch.amp.autocast('cuda'):
+                with torch.amp.autocast('cuda'): # Assuming 'cuda' is the intended device for autocast
                     input_heatmaps = scripted_backbone(inputs.view(-1, 3, inputs.shape[3], inputs.shape[4]))
                     input_heatmaps = input_heatmaps.view(-1, config.DATASET.CAMERA_NUM, input_heatmaps.shape[1], input_heatmaps.shape[2], input_heatmaps.shape[3])
                     sample_grids = [sample_grids_dict[meta['seq'][j]] for j in range(input_heatmaps.shape[0])]
@@ -251,7 +244,7 @@ def main():
         mean_fps = 1.0 / mean_inference_time
         
         # 忽略前10次迭代的预热时间，重新计算
-        if len(inference_times) > 10:
+        if len(inference_times) > 10: # Consider making this warmup count configurable
             inference_times_no_first = inference_times[10:]
             mean_inference_time_no_first = np.mean(inference_times_no_first)
             mean_fps_no_first = 1.0 / mean_inference_time_no_first
