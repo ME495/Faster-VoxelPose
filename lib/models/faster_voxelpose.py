@@ -73,6 +73,7 @@ class FasterVoxelPoseNet(nn.Module):
         if views is not None:
             num_views = views.shape[1]
             input_heatmaps = torch.stack([backbone(views[:, c]) for c in range(num_views)], dim=1)
+            # print(input_heatmaps.shape, views.shape)
         
         batch_size = input_heatmaps.shape[0]
  

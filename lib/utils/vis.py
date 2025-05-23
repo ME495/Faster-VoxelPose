@@ -243,7 +243,8 @@ def save_image_with_poses(config, images, poses, meta, cameras, resize_transform
                 if poses[i, n, 0, 4] < config.CAPTURE_SPEC.MIN_SCORE:
                     continue
 
-                color = np.flip(np.array(matplotlib.colors.to_rgb(colors[int(n % 10)]))) * 255
+                # color = np.flip(np.array(matplotlib.colors.to_rgb(colors[int((n+1) % 10)]))) * 255
+                color = np.flip(np.array(matplotlib.colors.to_rgb(colors[5]))) * 255
                 pose_2d = project_pose(poses[i, n, :, :3], cameras[curr_seq][c])
                 pose_2d = do_transform(pose_2d, resize_transform)
                 
