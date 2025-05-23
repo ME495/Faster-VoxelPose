@@ -42,10 +42,13 @@ def preprocess_panoptic(image_size, trans):
     data_dir = 'data/Panoptic'
     cam_list = [(0, 3), (0, 6), (0, 12), (0, 13), (0, 23)]
 
+    # TRAIN_LIST = [
+    #     '160422_ultimatum1', '160224_haggling1', '160226_haggling1',
+    #     '161202_haggling1', '160906_ian1', '160906_ian2',
+    #     '160906_ian3', '160906_band1', '160906_band2',# '160906_band3',
+    # ]
     TRAIN_LIST = [
-        '160422_ultimatum1', '160224_haggling1', '160226_haggling1',
-        '161202_haggling1', '160906_ian1', '160906_ian2',
-        '160906_ian3', '160906_band1', '160906_band2',# '160906_band3',
+        '160906_band2',# '160906_band3',
     ]
     VAL_LIST = ['160906_pizza1', '160422_haggling1', '160906_ian5', '160906_band4']
 
