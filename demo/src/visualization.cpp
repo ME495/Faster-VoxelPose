@@ -65,19 +65,25 @@ void save_image_with_poses_cpp(
     int num_joints = poses_3d.size(2);
 
     for (int p = 0; p < max_people; ++p) {
-        // 使用某个显著关节的分数（例如关节0）或专用人员分数（如果有）
-        float person_score = (num_joints > 0 && poses_3d.size(3) > 3) ? poses_accessor[0][p][0][3] : 0.0f; // 例如：关节0的分数
-        if (poses_3d.size(3) > 4) { // 如果存在第5个元素，则按Python中的poses[i,n,0,4]使用
-             person_score = poses_accessor[0][p][0][4];
+        // 检查是否是真实人体（第4维度 >= 0）
+        float is_real_person = poses_accessor[0][p][0][3]; // 所有关节点的值相同
+        if (is_real_person < 0.0f) {
+            continue; // 跳过非真实人体
         }
+        
+        // 获取人体置信度
+        float person_confidence = poses_accessor[0][p][0][4]; // 所有关节点的值相同
 
-        // 过滤掉低分数的人
-        if (person_score < min_pose_score) {
+        // 过滤掉低置信度的人体
+        if (person_confidence < min_pose_score) {
             continue;
         }
 
-        // 为每个人使用不同颜色
-        cv::Scalar color = VIS_COLORS[p % VIS_COLORS.size()];
+        // 获取跟踪器分配的人体ID（存储在第4维度）
+        int tracked_person_id = static_cast<int>(is_real_person);
+        
+        // 为每个人使用不同颜色（基于跟踪ID而不是数组索引）
+        cv::Scalar color = VIS_COLORS[tracked_person_id % VIS_COLORS.size()];
 
         // 提取当前人的3D姿态点
         torch::Tensor current_pose_3d_pts = poses_3d.select(0,0).select(0,p).slice(1,0,3).contiguous(); // (NumJoints, 3)
@@ -113,7 +119,7 @@ void save_image_with_poses_cpp(
             }
         }
 
-        // 添加人员编号标识 - 在头部附近显示人员编号
+        // 添加人员编号标识 - 显示跟踪器分配的真实ID
         if (num_joints > 0) {
             torch::Tensor head_pt_tensor = pose_2d_transformed[0]; // 假设关节0是头部或颈部
             if (is_valid_coord_cpp(head_pt_tensor, img_w, img_h)) {
@@ -121,7 +127,7 @@ void save_image_with_poses_cpp(
                     static_cast<int>(head_pt_tensor[0].item<float>()) - 10,
                     static_cast<int>(head_pt_tensor[1].item<float>()) - 15
                 );
-                std::string person_id = "P" + std::to_string(p + 1);
+                std::string person_id = "ID" + std::to_string(tracked_person_id);
                 
                 // 绘制白色背景的文本，使其更加醒目
                 cv::putText(output_display, person_id, text_pos, cv::FONT_HERSHEY_SIMPLEX, 

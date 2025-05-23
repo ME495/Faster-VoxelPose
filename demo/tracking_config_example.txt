@@ -1,0 +1,82 @@
+# 人体跟踪参数配置示例
+
+## 当前默认设置
+max_frame_gap = 10        # 最大丢失帧数
+distance_threshold = 500.0 # 距离阈值
+
+## 不同场景的建议参数
+
+### 场景1: 室内近距离场景 (人体较大, 运动较慢)
+max_frame_gap = 15
+distance_threshold = 300.0
+# 原因: 人体较大时关节点距离较稳定，可以使用较小的阈值
+# 室内场景遮挡较少，可以允许更长的丢失时间
+
+### 场景2: 室外远距离场景 (人体较小, 检测不稳定)  
+max_frame_gap = 8
+distance_threshold = 800.0
+# 原因: 远距离时关节点检测误差较大，需要更宽松的阈值
+# 但检测不稳定，丢失时间不宜过长
+
+### 场景3: 高密度人群场景 (多人, 频繁遮挡)
+max_frame_gap = 5
+distance_threshold = 200.0
+# 原因: 多人场景需要严格匹配避免ID混淆
+# 频繁遮挡时快速清理避免错误累积
+
+### 场景4: 运动激烈场景 (快速移动, 姿态变化大)
+max_frame_gap = 12
+distance_threshold = 1000.0
+# 原因: 快速运动导致相邻帧距离较大，需要宽松阈值
+# 运动连续性好，可以允许较长的跟踪间隔
+
+### 场景5: 高精度跟踪场景 (要求ID稳定性)
+max_frame_gap = 20
+distance_threshold = 400.0
+# 原因: 优先保持ID连续性，允许较长的丢失时间
+# 中等阈值平衡准确性和稳定性
+
+## 如何在代码中修改参数
+
+在src/main.cpp中找到以下行：
+```cpp
+PersonTracker person_tracker(10, 500.0f);
+```
+
+修改为你需要的参数：
+```cpp
+PersonTracker person_tracker(your_max_frame_gap, your_distance_threshold);
+```
+
+例如，对于室内场景：
+```cpp
+PersonTracker person_tracker(15, 300.0f);
+```
+
+## 参数调优步骤
+
+1. **初始测试**: 使用默认参数运行几帧，观察跟踪效果
+2. **分析问题**: 
+   - ID跳跃频繁 -> 增大distance_threshold
+   - ID混淆严重 -> 减小distance_threshold  
+   - 短暂遮挡后ID改变 -> 增大max_frame_gap
+   - 长时间错误跟踪 -> 减小max_frame_gap
+3. **渐进调整**: 每次只调整一个参数，观察效果
+4. **验证效果**: 在完整序列上测试最终参数
+
+## 性能影响
+
+### distance_threshold的影响
+- 较小值: 计算量相对稳定，但可能产生更多跟踪实例
+- 较大值: 匹配成功率高，但可能有错误匹配
+
+### max_frame_gap的影响  
+- 较小值: 内存占用少，计算开销小
+- 较大值: 内存占用多，每帧需要检查更多历史实例
+
+## 调试建议
+
+1. 在控制台输出中观察跟踪人体数量的变化
+2. 在可视化图像中检查ID的连续性和颜色一致性
+3. 记录每帧的匹配距离，分析distance_threshold是否合适
+4. 统计ID创建和删除的频率，评估max_frame_gap设置 

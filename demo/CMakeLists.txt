@@ -47,6 +47,7 @@ set(SOURCES
     src/visualization.cpp
     src/image_processing.cpp
     src/tensorrt_inference.cpp
+    src/person_tracker.cpp
 )
 
 # set(CAFFE2_USE_CUDNN ON) # This line is generally for Caffe2, LibTorch handles its own cuDNN

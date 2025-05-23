@@ -22,6 +22,7 @@
 #include "visualization.h"
 #include "image_processing.h"
 #include "tensorrt_inference.h"
+#include "person_tracker.h"
 
 int main(int argc, const char* argv[]) {
     if (argc < 6) { // Prog_name, backbone, model, calib.json, image_base_dir, device
@@ -229,6 +230,10 @@ int main(int argc, const char* argv[]) {
     // 启动图片读取线程
     std::thread image_loader_thread(image_loader_thread_func, frames_to_run);
 
+    // --- 初始化人体跟踪器 ---
+    PersonTracker person_tracker(10, 500.0f); // 最大丢失帧数10，距离阈值500.0
+    std::cout << "已初始化人体跟踪器 (最大丢失帧数: 10, 距离阈值: 500.0)" << std::endl;
+
     // --- 处理循环 ---
     torch::NoGradGuard no_grad;
     long long total_duration_ms = 0;
@@ -307,6 +312,18 @@ int main(int argc, const char* argv[]) {
         model_inputs.push_back(final_sample_grid_coarse); 
         model_inputs.push_back(final_sample_grid_fine);
         torch::Tensor fused_poses = model_module.forward(model_inputs).toTensor();
+        
+        // --- 4. 人体跟踪 ---
+        if (fused_poses.defined() && fused_poses.numel() > 0) {
+            fused_poses = person_tracker.update(fused_poses, frame_idx);
+            
+            // 输出跟踪信息（每50帧或最后一帧）
+            if (frame_idx % 50 == 0 || frame_idx == frames_to_run - 1) {
+                std::cout << "  帧 " << frame_idx << ": 当前跟踪 " 
+                         << person_tracker.get_tracked_person_count() << " 个人体" << std::endl;
+            }
+        }
+        
         auto pose_estimation_end_time = std::chrono::high_resolution_clock::now();
         if (device_type == torch::kCUDA) {
             torch::cuda::synchronize(); 
