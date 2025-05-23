@@ -8,14 +8,28 @@
 #define M_PI 3.14159265358979323846
 #endif
 
-// 定义可视化颜色(BGR格式，用于OpenCV)
+// 定义可视化颜色(BGR格式，用于OpenCV) - 扩展调色板以支持更多人
 const std::vector<cv::Scalar> VIS_COLORS = {
-    cv::Scalar(255, 0, 0),   // 蓝色
-    cv::Scalar(0, 255, 0),   // 绿色
-    cv::Scalar(0, 0, 255),   // 红色
-    cv::Scalar(255, 255, 0), // 青色
-    cv::Scalar(255, 0, 255), // 品红
-    cv::Scalar(0, 255, 255), // 黄色
+    cv::Scalar(255, 0, 0),     // 蓝色
+    cv::Scalar(0, 255, 0),     // 绿色  
+    cv::Scalar(0, 0, 255),     // 红色
+    cv::Scalar(255, 255, 0),   // 青色
+    cv::Scalar(255, 0, 255),   // 品红
+    cv::Scalar(0, 255, 255),   // 黄色
+    cv::Scalar(128, 0, 128),   // 紫色
+    cv::Scalar(255, 165, 0),   // 橙色 (BGR格式)
+    cv::Scalar(0, 128, 255),   // 橙红色
+    cv::Scalar(147, 20, 255),  // 深粉色
+    cv::Scalar(0, 255, 127),   // 春绿色
+    cv::Scalar(255, 20, 147),  // 深粉红
+    cv::Scalar(30, 144, 255),  // 道奇蓝
+    cv::Scalar(50, 205, 50),   // 酸橙绿
+    cv::Scalar(255, 69, 0),    // 红橙色
+    cv::Scalar(138, 43, 226),  // 蓝紫色
+    cv::Scalar(0, 191, 255),   // 深天蓝
+    cv::Scalar(127, 255, 0),   // 查特利绿
+    cv::Scalar(255, 105, 180), // 热粉色
+    cv::Scalar(32, 178, 170),  // 浅海绿
 };
 
 // 列出目录中的图像文件，按字母顺序排序

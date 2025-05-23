@@ -86,16 +86,20 @@ void save_image_with_poses_cpp(
         torch::Tensor pose_2d_projected = project_pose_cpp(current_pose_3d_pts, camera_params); // (NumJoints, 2)
         torch::Tensor pose_2d_transformed = affine_transform_pts_cpp(pose_2d_projected, resize_transform); // (NumJoints, 2)
         
-        // 绘制关节点
+        // 绘制关节点 - 使用更大的关节点以便区分不同的人
+        int joint_radius = 5; // 增大关节点半径
         for (int j = 0; j < num_joints; ++j) {
             torch::Tensor pt_tensor = pose_2d_transformed[j];
             if (is_valid_coord_cpp(pt_tensor, img_w, img_h)) {
                 cv::Point center(static_cast<int>(pt_tensor[0].item<float>()), static_cast<int>(pt_tensor[1].item<float>()));
-                cv::circle(output_display, center, 4, color, -1); // 半径4
+                cv::circle(output_display, center, joint_radius, color, -1); // 填充圆圈
+                // 添加白色边框使关节点更突出
+                cv::circle(output_display, center, joint_radius, cv::Scalar(255, 255, 255), 1);
             }
         }
 
-        // 绘制肢体（关节连接）
+        // 绘制肢体（关节连接）- 使用更粗的线条
+        int line_thickness = 3; // 增加线条粗细
         for (const auto& limb : limbs) {
             if (limb.first >= num_joints || limb.second >= num_joints) continue;
 
@@ -105,7 +109,25 @@ void save_image_with_poses_cpp(
             if (is_valid_coord_cpp(p1_tensor, img_w, img_h) && is_valid_coord_cpp(p2_tensor, img_w, img_h)) {
                 cv::Point p1(static_cast<int>(p1_tensor[0].item<float>()), static_cast<int>(p1_tensor[1].item<float>()));
                 cv::Point p2(static_cast<int>(p2_tensor[0].item<float>()), static_cast<int>(p2_tensor[1].item<float>()));
-                cv::line(output_display, p1, p2, color, 2); // 线宽2
+                cv::line(output_display, p1, p2, color, line_thickness); // 更粗的线条
+            }
+        }
+
+        // 添加人员编号标识 - 在头部附近显示人员编号
+        if (num_joints > 0) {
+            torch::Tensor head_pt_tensor = pose_2d_transformed[0]; // 假设关节0是头部或颈部
+            if (is_valid_coord_cpp(head_pt_tensor, img_w, img_h)) {
+                cv::Point text_pos(
+                    static_cast<int>(head_pt_tensor[0].item<float>()) - 10,
+                    static_cast<int>(head_pt_tensor[1].item<float>()) - 15
+                );
+                std::string person_id = "P" + std::to_string(p + 1);
+                
+                // 绘制白色背景的文本，使其更加醒目
+                cv::putText(output_display, person_id, text_pos, cv::FONT_HERSHEY_SIMPLEX, 
+                           0.6, cv::Scalar(255, 255, 255), 4, cv::LINE_AA); // 白色背景
+                cv::putText(output_display, person_id, text_pos, cv::FONT_HERSHEY_SIMPLEX, 
+                           0.6, color, 2, cv::LINE_AA); // 彩色前景
             }
         }
     }
