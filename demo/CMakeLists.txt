@@ -46,9 +46,40 @@ set(SOURCES
     src/utils.cpp
     src/visualization.cpp
     src/image_processing.cpp
+    src/tensorrt_inference.cpp
 )
 
 # set(CAFFE2_USE_CUDNN ON) # This line is generally for Caffe2, LibTorch handles its own cuDNN
+
+# --- TensorRT ---
+set(TENSORRT_ROOT "D:/opt/TensorRT-8.6.1.6.Windows10.x86_64.cuda-11.8/TensorRT-8.6.1.6")
+# 查找 TensorRT 库
+find_path(TENSORRT_INCLUDE_DIR NvInfer.h
+    HINTS ${TENSORRT_ROOT} ${CUDA_TOOLKIT_ROOT_DIR}
+    PATH_SUFFIXES include)
+
+find_library(TENSORRT_LIBRARY_INFER nvinfer
+    HINTS ${TENSORRT_ROOT} ${TENSORRT_BUILD} ${CUDA_TOOLKIT_ROOT_DIR}
+    PATH_SUFFIXES lib lib64 lib/x64)
+
+find_library(TENSORRT_LIBRARY_RUNTIME nvinfer_plugin
+    HINTS ${TENSORRT_ROOT} ${TENSORRT_BUILD} ${CUDA_TOOLKIT_ROOT_DIR}
+    PATH_SUFFIXES lib lib64 lib/x64)
+
+if(TENSORRT_INCLUDE_DIR AND TENSORRT_LIBRARY_INFER)
+    message(STATUS "Found TensorRT: ${TENSORRT_INCLUDE_DIR}")
+    set(TENSORRT_FOUND TRUE)
+else()
+    message(WARNING "TensorRT not found. You may need to set TENSORRT_ROOT or install TensorRT.")
+    set(TENSORRT_FOUND FALSE)
+endif()
+
+# --- CUDA ---
+find_package(CUDA REQUIRED)
+if(CUDA_FOUND)
+    enable_language(CUDA)
+    message(STATUS "Found CUDA: ${CUDA_VERSION}")
+endif()
 
 # --- LibTorch --- 
 # 根据构建类型选择不同的libtorch路径
@@ -77,6 +108,8 @@ include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${TORCH_INCLUDE_DIRS}
     ${OpenCV_INCLUDE_DIRS}
+    ${TENSORRT_INCLUDE_DIR}
+    ${CUDA_INCLUDE_DIRS}
 )
 
 add_executable(faster_voxelpose_demo ${SOURCES})
@@ -84,6 +117,10 @@ add_executable(faster_voxelpose_demo ${SOURCES})
 target_link_libraries(faster_voxelpose_demo
     "${TORCH_LIBRARIES}"
     "${OpenCV_LIBS}"
+    ${TENSORRT_LIBRARY_INFER}
+    ${TENSORRT_LIBRARY_RUNTIME}
+    ${CUDA_LIBRARIES}
+    ${CUDA_CUDART_LIBRARY}
 )
 
 set_property(TARGET faster_voxelpose_demo PROPERTY CXX_STANDARD 17)

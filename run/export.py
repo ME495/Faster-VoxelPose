@@ -36,19 +36,19 @@ def main():
                       input_names=["input"], output_names=["output"], do_constant_folding=True)
     print(f'=> ONNX backbone saved to {onnx_backbone_path}')
 
-    # ONNX图优化
-    print(f'=> Optimizing ONNX backbone model: {onnx_backbone_path}')
-    optimized_onnx_backbone_path = os.path.join(final_output_dir, "backbone_optimized.onnx")
-    try:
-        sess_options = ort.SessionOptions()
-        sess_options.optimized_model_filepath = optimized_onnx_backbone_path
-        sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL # 或者 ORT_ENABLE_EXTENDED
-        ort.InferenceSession(onnx_backbone_path, sess_options, providers=['CPUExecutionProvider'])
-        print(f'=> Optimized ONNX backbone saved to {optimized_onnx_backbone_path}')
-        # 后续在validate_onnx_ts.py中应该加载这个优化后的模型
-    except Exception as e:
-        print(f"Error during ONNX model optimization: {e}")
-        print("Please ensure onnxruntime is correctly installed and the model is valid.")
+    # # ONNX图优化
+    # print(f'=> Optimizing ONNX backbone model: {onnx_backbone_path}')
+    # optimized_onnx_backbone_path = os.path.join(final_output_dir, "backbone_optimized.onnx")
+    # try:
+    #     sess_options = ort.SessionOptions()
+    #     sess_options.optimized_model_filepath = optimized_onnx_backbone_path
+    #     sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL # 或者 ORT_ENABLE_EXTENDED
+    #     ort.InferenceSession(onnx_backbone_path, sess_options, providers=['CPUExecutionProvider'])
+    #     print(f'=> Optimized ONNX backbone saved to {optimized_onnx_backbone_path}')
+    #     # 后续在validate_onnx_ts.py中应该加载这个优化后的模型
+    # except Exception as e:
+    #     print(f"Error during ONNX model optimization: {e}")
+    #     print("Please ensure onnxruntime is correctly installed and the model is valid.")
 
     # 2. 创建并加载主模型
     print('=> creating FasterVoxelPoseNetTS model...')

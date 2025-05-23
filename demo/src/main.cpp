@@ -21,6 +21,7 @@
 #include "utils.h"
 #include "visualization.h"
 #include "image_processing.h"
+#include "tensorrt_inference.h"
 
 int main(int argc, const char* argv[]) {
     if (argc < 6) { // Prog_name, backbone, model, calib.json, image_base_dir, device
@@ -120,16 +121,23 @@ int main(int argc, const char* argv[]) {
     std::cout << "将处理 " << frames_to_run << " 帧." << std::endl;
 
     // 加载模型
-    torch::jit::script::Module backbone_module, model_module;
+    std::unique_ptr<TensorRTInference> backbone_trt;
+    torch::jit::script::Module model_module;
     try {
-        backbone_module = torch::jit::load(backbone_path, device);
-        backbone_module.eval();
-        // 转换backbone模型到半精度
-        backbone_module.to(torch::kHalf);
+        // 检查 backbone 文件扩展名
+        if (backbone_path.substr(backbone_path.find_last_of(".") + 1) == "trt") {
+            std::cout << "加载 TensorRT backbone 引擎: " << backbone_path << std::endl;
+            backbone_trt = std::make_unique<TensorRTInference>(backbone_path, device);
+            if (!backbone_trt->isInitialized()) {
+                throw std::runtime_error("TensorRT backbone 初始化失败");
+            }
+        } else {
+            throw std::runtime_error("backbone 文件必须是 .trt 格式");
+        }
         
         model_module = torch::jit::load(model_path, device);
         model_module.eval();
-    } catch (const c10::Error& e) {
+    } catch (const std::exception& e) {
         std::cerr << "加载模型时出错:\n" << e.what() << std::endl;
         return -1;
     }
@@ -283,7 +291,7 @@ int main(int argc, const char* argv[]) {
         auto heatmap_extraction_start_time = std::chrono::high_resolution_clock::now();
         torch::Tensor batch_input = torch::cat(batch_tensors, 0);  // [NUM_CAMERAS, 3, H, W]
         batch_input = batch_input.to(torch::kHalf);
-        torch::Tensor batch_heatmaps = backbone_module.forward({batch_input}).toTensor();
+        torch::Tensor batch_heatmaps = backbone_trt->forward(batch_input);
         batch_heatmaps = batch_heatmaps.to(torch::kFloat);
         batch_heatmaps = batch_heatmaps.unsqueeze(0);
         auto heatmap_extraction_end_time = std::chrono::high_resolution_clock::now();
@@ -321,30 +329,30 @@ int main(int argc, const char* argv[]) {
             total_duration_ms += overall_frame_duration.count();
             frames_processed_for_fps++;
         }
-        // // --- 可视化（示例：热身后每20帧保存一次）---
-        // if (frame_idx >= warmup_frames && frame_idx % 20 == 0) {
-        //     if (fused_poses.defined() && fused_poses.numel() > 0 && 
-        //         fused_poses.dim() == 4 && batch_tensors.size() == NUM_CAMERAS) {
-        //         int num_joints_from_pose = fused_poses.size(2);
-        //         std::vector<std::pair<int, int>> current_limbs = get_limbs_definition(num_joints_from_pose);
-        //         for (int view_idx = 0; view_idx < NUM_CAMERAS; ++view_idx) {
-        //             std::string vis_output_prefix = "output_frame_" + std::to_string(frame_idx);
-        //             if (batch_tensors[view_idx].size(0) == 1) {
-        //                  save_image_with_poses_cpp(
-        //                     vis_output_prefix,
-        //                     batch_tensors[view_idx].squeeze(0),
-        //                     fused_poses,
-        //                     cameras[view_idx],
-        //                     resize_transform_tensor,
-        //                     view_idx,
-        //                     0.2f,
-        //                     current_limbs,
-        //                     ori_image_size_cfg
-        //                 );
-        //             }
-        //         }
-        //     }
-        // }
+        // --- 可视化（示例：热身后每20帧保存一次）---
+        if (frame_idx >= warmup_frames && frame_idx % 20 == 0) {
+            if (fused_poses.defined() && fused_poses.numel() > 0 && 
+                fused_poses.dim() == 4 && batch_tensors.size() == NUM_CAMERAS) {
+                int num_joints_from_pose = fused_poses.size(2);
+                std::vector<std::pair<int, int>> current_limbs = get_limbs_definition(num_joints_from_pose);
+                for (int view_idx = 0; view_idx < NUM_CAMERAS; ++view_idx) {
+                    std::string vis_output_prefix = "output_frame_" + std::to_string(frame_idx);
+                    if (batch_tensors[view_idx].size(0) == 1) {
+                        save_image_with_poses_cpp(
+                            vis_output_prefix,
+                            batch_tensors[view_idx].squeeze(0),
+                            fused_poses,
+                            cameras[view_idx],
+                            resize_transform_tensor,
+                            view_idx,
+                            0.2f,
+                            current_limbs,
+                            ori_image_size_cfg
+                        );
+                    }
+                }
+            }
+        }
     }
     // 等待图片读取线程结束
     if (image_loader_thread.joinable()) {
