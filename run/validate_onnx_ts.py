@@ -17,6 +17,8 @@ import os
 from tqdm import tqdm
 import time
 import numpy as np
+import onnx
+import onnxruntime as ort
 
 import _init_paths
 from core.config import config, update_config
@@ -142,14 +144,6 @@ def main():
     cudnn.benchmark = config.CUDNN.BENCHMARK
     torch.backends.cudnn.deterministic = config.CUDNN.DETERMINISTIC
     torch.backends.cudnn.enabled = config.CUDNN.ENABLED
-    
-    # --- Load Scripted Backbone ---
-    scripted_backbone_path = os.path.join(final_output_dir, "scripted_backbone.pt")
-    if not os.path.isfile(scripted_backbone_path):
-        raise ValueError(f"Scripted backbone not found at {scripted_backbone_path}. Please run export.py first.")
-    print(f'=> loading scripted backbone from {scripted_backbone_path}')
-    scripted_backbone = torch.jit.load(scripted_backbone_path, map_location=config.DEVICE)
-    scripted_backbone.eval() # Ensure it's in eval mode
 
     # --- Load Scripted Main Model ---
     scripted_model_path = os.path.join(final_output_dir, "scripted_faster_voxelpose_ts.pt")
@@ -159,11 +153,20 @@ def main():
     scripted_model = torch.jit.load(scripted_model_path, map_location=config.DEVICE)
     scripted_model.eval() # Ensure it's in eval mode
 
+    # --- Load ONNX Backbone ---
+    onnx_backbone_path = os.path.join(final_output_dir, "backbone.onnx")
+    if not os.path.isfile(onnx_backbone_path):
+        raise ValueError(f"ONNX backbone not found at {onnx_backbone_path}. Please run export.py first.")
+    print(f'=> loading ONNX backbone from {onnx_backbone_path}')
+    ort_session = ort.InferenceSession(onnx_backbone_path, providers=['TensorrtExecutionProvider', 'CUDAExecutionProvider'])
+    print(ort_session.get_providers())
+
     print("=> validating with pre-exported TorchScript models...")
 
     # loading constants of the dataset
     cameras = test_loader.dataset.cameras
     resize_transform = torch.as_tensor(test_loader.dataset.resize_transform, dtype=torch.float, device=config.DEVICE)
+    print(resize_transform)
     
     with torch.no_grad():
         all_fused_poses = []
@@ -210,26 +213,27 @@ def main():
             start_time = time.time()
             
             if config.DATASET.TEST_HEATMAP_SRC == 'image':
-                inputs = inputs.to(config.DEVICE)
-                
-                with torch.amp.autocast('cuda'): # Assuming 'cuda' is the intended device for autocast
-                    backbone_start_time = time.time()
-                    input_heatmaps = scripted_backbone(inputs.view(-1, 3, inputs.shape[3], inputs.shape[4]))
-                    torch.cuda.synchronize() #确保backbone 推理完成
-                    backbone_end_time = time.time()
-                    backbone_inference_times.append(backbone_end_time - backbone_start_time)
+                # inputs = inputs.to(config.DEVICE)
+                # ONNX 推理部分（半精度）
+                backbone_start_time = time.time()
+                input_half = inputs.view(-1, 3, inputs.shape[3], inputs.shape[4]).numpy().astype(np.float16)
+                ort_inputs = {ort_session.get_inputs()[0].name: input_half}
+                ort_outs = ort_session.run(None, ort_inputs)
+                input_heatmaps = torch.from_numpy(ort_outs[0]).to(config.DEVICE).to(torch.float32)
+                torch.cuda.synchronize() #确保backbone 推理完成
+                backbone_end_time = time.time()
+                backbone_inference_times.append(backbone_end_time - backbone_start_time)
 
-                    model_start_time = time.time()
-                    input_heatmaps = input_heatmaps.view(-1, config.DATASET.CAMERA_NUM, input_heatmaps.shape[1], input_heatmaps.shape[2], input_heatmaps.shape[3])
-                    sample_grids = [sample_grids_dict[meta['seq'][j]] for j in range(input_heatmaps.shape[0])]
-                    sample_grids = torch.stack(sample_grids, dim=0)
-                    fine_sample_grids = [fine_sample_grids_dict[meta['seq'][j]] for j in range(input_heatmaps.shape[0])]
-                    fine_sample_grids = torch.stack(fine_sample_grids, dim=0)
-                    # print(input_heatmaps.shape, sample_grids.shape, fine_sample_grids.shape)
-                    fused_poses = scripted_model(input_heatmaps, sample_grids, fine_sample_grids)
-                    torch.cuda.synchronize() #确保model推理完成
-                    model_end_time = time.time()
-                    model_inference_times.append(model_end_time - model_start_time)
+                model_start_time = time.time()
+                input_heatmaps = input_heatmaps.view(-1, config.DATASET.CAMERA_NUM, input_heatmaps.shape[1], input_heatmaps.shape[2], input_heatmaps.shape[3])
+                sample_grids = [sample_grids_dict[meta['seq'][j]] for j in range(input_heatmaps.shape[0])]
+                sample_grids = torch.stack(sample_grids, dim=0)
+                fine_sample_grids = [fine_sample_grids_dict[meta['seq'][j]] for j in range(input_heatmaps.shape[0])]
+                fine_sample_grids = torch.stack(fine_sample_grids, dim=0)
+                fused_poses = scripted_model(input_heatmaps, sample_grids, fine_sample_grids)
+                torch.cuda.synchronize() #确保model推理完成
+                model_end_time = time.time()
+                model_inference_times.append(model_end_time - model_start_time)
             else:
                 raise ValueError('test heatmap source must be image!')
             

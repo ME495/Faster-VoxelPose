@@ -1,6 +1,7 @@
 import torch
 import argparse
 import os
+import onnxruntime as ort
 
 import _init_paths
 from core.config import config, update_config
@@ -29,6 +30,25 @@ def main():
     backbone_output_path = os.path.join(final_output_dir, "scripted_backbone.pt")
     scripted_backbone.save(backbone_output_path)
     print(f'=> Scripted backbone saved to {backbone_output_path}')
+    
+    onnx_backbone_path = os.path.join(final_output_dir,"backbone.onnx")
+    torch.onnx.export(backbone.half(), torch.randn(4, 3, 784, 1024, dtype=torch.float16), onnx_backbone_path, 
+                      input_names=["input"], output_names=["output"], do_constant_folding=True)
+    print(f'=> ONNX backbone saved to {onnx_backbone_path}')
+
+    # ONNX图优化
+    print(f'=> Optimizing ONNX backbone model: {onnx_backbone_path}')
+    optimized_onnx_backbone_path = os.path.join(final_output_dir, "backbone_optimized.onnx")
+    try:
+        sess_options = ort.SessionOptions()
+        sess_options.optimized_model_filepath = optimized_onnx_backbone_path
+        sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL # 或者 ORT_ENABLE_EXTENDED
+        ort.InferenceSession(onnx_backbone_path, sess_options, providers=['CPUExecutionProvider'])
+        print(f'=> Optimized ONNX backbone saved to {optimized_onnx_backbone_path}')
+        # 后续在validate_onnx_ts.py中应该加载这个优化后的模型
+    except Exception as e:
+        print(f"Error during ONNX model optimization: {e}")
+        print("Please ensure onnxruntime is correctly installed and the model is valid.")
 
     # 2. 创建并加载主模型
     print('=> creating FasterVoxelPoseNetTS model...')
@@ -55,6 +75,7 @@ def main():
     except Exception as e:
         print(f"Error during model scripting: {e}")
         print("Please check the model definition for TorchScript compatibility.")
+        
 
 if __name__ == '__main__':
     main()
