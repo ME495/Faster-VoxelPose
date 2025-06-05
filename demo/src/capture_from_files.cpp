@@ -359,8 +359,8 @@ int main(int argc, const char* argv[]) {
             total_duration_ms += overall_frame_duration.count();
             frames_processed_for_fps++;
         }
-        // --- 可视化（示例：热身后每20帧保存一次）---
-        if (frame_idx >= warmup_frames && frame_idx % 20 == 0) {
+        // --- 可视化（示例：热身后每30帧保存一次）---
+        if (frame_idx >= warmup_frames && frame_idx % 30 == 0) {
             if (fused_poses.defined() && fused_poses.numel() > 0 && 
                 fused_poses.dim() == 4 && batch_tensors.size() == NUM_CAMERAS) {
                 int num_joints_from_pose = fused_poses.size(2);

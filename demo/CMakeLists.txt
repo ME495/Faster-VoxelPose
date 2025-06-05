@@ -219,3 +219,220 @@ message(STATUS "OpenCV include dirs: ${OpenCV_INCLUDE_DIRS}")
 message(STATUS "nlohmann_json include dir: ${nlohmann_json_SOURCE_DIR}/include")
 message(STATUS "OpenSSL include dir: ${OPENSSL_INCLUDE_DIR}")
 message(STATUS "OpenSSL libraries: ${OPENSSL_LIBS}")
+
+# ============================================
+# 安装配置
+# ============================================
+
+# 设置安装目录
+if(CMAKE_INSTALL_PREFIX_INITIALIZED_TO_DEFAULT)
+  set(CMAKE_INSTALL_PREFIX "${CMAKE_BINARY_DIR}/install" CACHE PATH "..." FORCE)
+endif()
+
+# 定义安装组件
+set(VOXELPOSE_COMPONENT "VoxelPose")
+set(LICENSE_COMPONENT "LicenseGenerator")
+
+# ============================================
+# VoxelPose 程序安装 (capture_from_files + capture_from_cameras)
+# ============================================
+
+# 安装可执行文件
+install(TARGETS capture_from_files capture_from_cameras
+    RUNTIME DESTINATION ${VOXELPOSE_COMPONENT}
+    COMPONENT ${VOXELPOSE_COMPONENT}
+)
+
+# 安装LibTorch DLLs
+if(WIN32)
+    # 获取LibTorch DLL路径
+    get_target_property(TORCH_DLLS torch IMPORTED_LOCATION_RELEASE)
+    if(NOT TORCH_DLLS)
+        get_target_property(TORCH_DLLS torch IMPORTED_LOCATION_DEBUG)
+    endif()
+    
+    if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+        set(TORCH_DLL_DIR "${CMAKE_PREFIX_PATH}/lib")
+    else()
+        set(TORCH_DLL_DIR "${CMAKE_PREFIX_PATH}/lib")
+    endif()
+    
+    # 安装LibTorch DLLs
+    install(FILES
+        "${TORCH_DLL_DIR}/asmjit.dll"
+        "${TORCH_DLL_DIR}/c10.dll"
+        "${TORCH_DLL_DIR}/c10_cuda.dll"
+        "${TORCH_DLL_DIR}/caffe2_nvrtc.dll"
+        "${TORCH_DLL_DIR}/fbgemm.dll"
+        "${TORCH_DLL_DIR}/fbjni.dll"
+        "${TORCH_DLL_DIR}/libiomp5md.dll"
+        "${TORCH_DLL_DIR}/libiompstubs5md.dll"
+        "${TORCH_DLL_DIR}/torch.dll"
+        "${TORCH_DLL_DIR}/torch_cpu.dll"
+        "${TORCH_DLL_DIR}/torch_cuda.dll"
+        "${TORCH_DLL_DIR}/uv.dll"
+        DESTINATION ${VOXELPOSE_COMPONENT}
+        COMPONENT ${VOXELPOSE_COMPONENT}
+        OPTIONAL
+    )
+    
+    # 安装OpenCV DLLs
+    if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+        set(OPENCV_DLL_SUFFIX "d")
+    else()
+        set(OPENCV_DLL_SUFFIX "")
+    endif()
+    
+    install(FILES
+        "${OpenCV_DIR}/x64/vc16/bin/opencv_world480${OPENCV_DLL_SUFFIX}.dll"
+        DESTINATION ${VOXELPOSE_COMPONENT}
+        COMPONENT ${VOXELPOSE_COMPONENT}
+        OPTIONAL
+    )
+    
+    # 安装TensorRT DLLs
+    install(FILES
+        "${TENSORRT_ROOT}/lib/nvinfer.dll"
+        "${TENSORRT_ROOT}/lib/nvinfer_plugin.dll"
+        "${TENSORRT_ROOT}/lib/nvonnxparser.dll"
+        "${TENSORRT_ROOT}/lib/nvparsers.dll"
+        DESTINATION ${VOXELPOSE_COMPONENT}
+        COMPONENT ${VOXELPOSE_COMPONENT}
+        OPTIONAL
+    )
+    
+    # 安装CUDA Runtime DLLs (需要根据实际CUDA版本调整)
+    set(CUDA_BIN_DIR "${CUDA_TOOLKIT_ROOT_DIR}/bin")
+    install(FILES
+        "${CUDA_BIN_DIR}/cudart64_118.dll"
+        "${CUDA_BIN_DIR}/curand64_10.dll"
+        "${CUDA_BIN_DIR}/cusparse64_11.dll"
+        "${CUDA_BIN_DIR}/cublas64_11.dll"
+        "${CUDA_BIN_DIR}/cublasLt64_11.dll"
+        "${CUDA_BIN_DIR}/cusolver64_11.dll"
+        "${CUDA_BIN_DIR}/cusolverMg64_11.dll"
+        "${CUDA_BIN_DIR}/cufft64_10.dll"
+        "${CUDA_BIN_DIR}/nvrtc64_118_0.dll"
+        "${CUDA_BIN_DIR}/nvrtc-builtins64_118.dll"
+        DESTINATION ${VOXELPOSE_COMPONENT}
+        COMPONENT ${VOXELPOSE_COMPONENT}
+        OPTIONAL
+    )
+    
+    # 安装OpenSSL DLLs
+    install(FILES
+        "${OPENSSL_ROOT_DIR}/bin/libssl-3-x64.dll"
+        "${OPENSSL_ROOT_DIR}/bin/libcrypto-3-x64.dll"
+        DESTINATION ${VOXELPOSE_COMPONENT}
+        COMPONENT ${VOXELPOSE_COMPONENT}
+        OPTIONAL
+    )
+    
+    # 安装GigE Library DLLs (仅capture_from_cameras需要)
+    install(FILES
+        "${GIGELIB_LIB_DIR}/GigELib_v141.dll"
+        DESTINATION ${VOXELPOSE_COMPONENT}
+        COMPONENT ${VOXELPOSE_COMPONENT}
+        OPTIONAL
+    )
+endif()
+
+# ============================================
+# License Generator 安装
+# ============================================
+
+# 安装可执行文件
+install(TARGETS license_generator
+    RUNTIME DESTINATION ${LICENSE_COMPONENT}
+    COMPONENT ${LICENSE_COMPONENT}
+)
+
+# 安装OpenSSL DLLs (license_generator只需要OpenSSL)
+if(WIN32)
+    install(FILES
+        "${OPENSSL_ROOT_DIR}/bin/libssl-3-x64.dll"
+        "${OPENSSL_ROOT_DIR}/bin/libcrypto-3-x64.dll"
+        DESTINATION ${LICENSE_COMPONENT}
+        COMPONENT ${LICENSE_COMPONENT}
+        OPTIONAL
+    )
+endif()
+
+# ============================================
+# 安装脚本和说明文件
+# ============================================
+
+# 创建批处理脚本
+configure_file("${CMAKE_SOURCE_DIR}/scripts/install_voxelpose.bat.in" 
+               "${CMAKE_BINARY_DIR}/install_voxelpose.bat" @ONLY)
+configure_file("${CMAKE_SOURCE_DIR}/scripts/install_license_generator.bat.in" 
+               "${CMAKE_BINARY_DIR}/install_license_generator.bat" @ONLY)
+
+# 安装批处理脚本
+install(FILES "${CMAKE_BINARY_DIR}/install_voxelpose.bat"
+        DESTINATION ${VOXELPOSE_COMPONENT}
+        COMPONENT ${VOXELPOSE_COMPONENT})
+
+install(FILES "${CMAKE_BINARY_DIR}/install_license_generator.bat"
+        DESTINATION ${LICENSE_COMPONENT}
+        COMPONENT ${LICENSE_COMPONENT})
+
+# 安装说明文档
+install(FILES "${CMAKE_SOURCE_DIR}/README_INSTALL.md"
+        DESTINATION .
+        COMPONENT ${VOXELPOSE_COMPONENT})
+
+install(FILES "${CMAKE_SOURCE_DIR}/README_INSTALL.md"
+        DESTINATION .
+        COMPONENT ${LICENSE_COMPONENT})
+
+# 安装主安装脚本（在根目录）
+install(FILES 
+        "${CMAKE_SOURCE_DIR}/install.bat"
+        "${CMAKE_SOURCE_DIR}/uninstall.bat"
+        DESTINATION .
+        COMPONENT ${VOXELPOSE_COMPONENT})
+
+# ============================================
+# 创建安装包配置
+# ============================================
+
+# 设置 CPack 变量
+set(CPACK_PACKAGE_NAME "VoxelPose")
+set(CPACK_PACKAGE_VERSION "1.0.0")
+set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "VoxelPose 3D Human Pose Estimation System")
+set(CPACK_PACKAGE_VENDOR "VoxelPose Team")
+
+# 创建两个不同的安装包
+set(CPACK_COMPONENTS_ALL ${VOXELPOSE_COMPONENT} ${LICENSE_COMPONENT})
+set(CPACK_COMPONENT_VOXELPOSE_DISPLAY_NAME "VoxelPose Main Application")
+set(CPACK_COMPONENT_VOXELPOSE_DESCRIPTION "VoxelPose pose estimation applications")
+set(CPACK_COMPONENT_LICENSEGENERATOR_DISPLAY_NAME "License Generator")
+set(CPACK_COMPONENT_LICENSEGENERATOR_DESCRIPTION "License generation utility")
+
+# Windows平台使用NSIS或ZIP
+if(WIN32)
+    set(CPACK_GENERATOR "ZIP;NSIS")
+    set(CPACK_NSIS_DISPLAY_NAME "VoxelPose ${CPACK_PACKAGE_VERSION}")
+    set(CPACK_NSIS_PACKAGE_NAME "VoxelPose")
+    set(CPACK_NSIS_ENABLE_UNINSTALL_BEFORE_INSTALL ON)
+endif()
+
+include(CPack)
+
+# 自定义安装目标
+add_custom_target(install_voxelpose
+    COMMAND ${CMAKE_COMMAND} --build . --target install --config $<CONFIG> -- /p:Component=${VOXELPOSE_COMPONENT}
+    DEPENDS capture_from_files capture_from_cameras
+    COMMENT "Installing VoxelPose applications and dependencies"
+)
+
+add_custom_target(install_license_gen
+    COMMAND ${CMAKE_COMMAND} --build . --target install --config $<CONFIG> -- /p:Component=${LICENSE_COMPONENT}
+    DEPENDS license_generator
+    COMMENT "Installing License Generator and dependencies"
+)
+
+message(STATUS "Install prefix: ${CMAKE_INSTALL_PREFIX}")
+message(STATUS "VoxelPose will be installed to: ${CMAKE_INSTALL_PREFIX}/${VOXELPOSE_COMPONENT}")
+message(STATUS "License Generator will be installed to: ${CMAKE_INSTALL_PREFIX}/${LICENSE_COMPONENT}")
