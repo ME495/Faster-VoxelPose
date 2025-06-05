@@ -39,7 +39,6 @@ endif()
 
 # 源文件
 set(SOURCES
-    src/capture_from_files.cpp
     src/types.cpp
     src/camera.cpp
     src/projection.cpp
@@ -51,6 +50,19 @@ set(SOURCES
 )
 
 # set(CAFFE2_USE_CUDNN ON) # This line is generally for Caffe2, LibTorch handles its own cuDNN
+
+set(GIGELIB_ROOT "D:/opt/GIGECA/GigELib")
+set(GIGELIB_INCLUDE_DIR "${GIGELIB_ROOT}/include")
+set(GIGELIB_LIB_DIR ${GIGELIB_ROOT}/lib)
+
+# 根据构建类型选择不同的库名
+if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+    # Debug 版本
+    set(GIGELIB_LIBS "${GIGELIB_LIB_DIR}/GigELibd_v141.lib")
+else()
+    # Release 版本
+    set(GIGELIB_LIBS "${GIGELIB_LIB_DIR}/GigELib_v141.lib")
+endif()
 
 # --- TensorRT ---
 set(TENSORRT_ROOT "D:/opt/TensorRT-8.6.1.6.Windows10.x86_64.cuda-11.8/TensorRT-8.6.1.6")
@@ -111,9 +123,10 @@ include_directories(
     ${OpenCV_INCLUDE_DIRS}
     ${TENSORRT_INCLUDE_DIR}
     ${CUDA_INCLUDE_DIRS}
+    ${GIGELIB_INCLUDE_DIR}
 )
 
-add_executable(capture_from_files ${SOURCES})
+add_executable(capture_from_files src/capture_from_files.cpp ${SOURCES})
 
 target_link_libraries(capture_from_files
     "${TORCH_LIBRARIES}"
@@ -140,11 +153,38 @@ if (MSVC)
   target_compile_options(capture_from_files PRIVATE /MP)
 endif()
 
+add_executable(capture_from_cameras src/capture_from_cameras.cpp ${SOURCES})
+
+target_link_libraries(capture_from_cameras
+    "${TORCH_LIBRARIES}"
+    "${OpenCV_LIBS}"
+    ${TENSORRT_LIBRARY_INFER}
+    ${TENSORRT_LIBRARY_RUNTIME}
+    ${CUDA_LIBRARIES}
+    ${CUDA_CUDART_LIBRARY}
+    ${GIGELIB_LIBS}
+)
+
+set_property(TARGET capture_from_cameras PROPERTY CXX_STANDARD 17)
+
+# Apply link-time optimization to the target if supported
+if(LTO_SUPPORTED AND NOT CMAKE_BUILD_TYPE STREQUAL "Debug")
+  set_property(TARGET capture_from_cameras PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
+endif()
+
+if (MSVC)
+  # For Windows, need to copy Torch DLLs to the executable directory for execution
+  # or ensure they are in the PATH.
+  # This example does not automate DLL copying.
+  
+  # Enable multi-core compilation for MSVC
+  target_compile_options(capture_from_cameras PRIVATE /MP)
+endif()
+
 message(STATUS "Build type: ${CMAKE_BUILD_TYPE}")
 message(STATUS "C++ flags: ${CMAKE_CXX_FLAGS}")
 message(STATUS "C++ Release flags: ${CMAKE_CXX_FLAGS_RELEASE}")
 message(STATUS "LibTorch libraries: ${TORCH_LIBRARIES}")
-message(STATUS "OpenCV libraries: ${OpenCV_LIBS}")
 message(STATUS "Torch include dirs: ${TORCH_INCLUDE_DIRS}")
 message(STATUS "OpenCV include dirs: ${OpenCV_INCLUDE_DIRS}")
 message(STATUS "nlohmann_json include dir: ${nlohmann_json_SOURCE_DIR}/include")

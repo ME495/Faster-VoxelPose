@@ -9,6 +9,15 @@
 
 namespace fs = std::filesystem;
 
+void visualize_3d_pose(
+    cv::Mat& image,
+    const torch::Tensor& poses_3d,
+    const CameraParams& camera_params,
+    const torch::Tensor& resize_transform,
+    const std::vector<std::pair<int, int>>& limbs,
+    const std::vector<int>& original_image_size
+);
+
 // 保存带有3D姿态投影的图像
 void save_image_with_poses_cpp(
     const std::string& output_prefix_str,
