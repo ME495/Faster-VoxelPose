@@ -32,6 +32,7 @@
 #include "image_processing.h"
 #include "tensorrt_inference.h"
 #include "person_tracker.h"
+#include "license_auth.h"  // 添加授权验证头文件
 
 using namespace QUICKCAM;
 using namespace cv;
@@ -44,6 +45,18 @@ int main(int argc, const char* argv[]) {
                      "<device (cpu/cuda)> [bind_ip_address]" << std::endl;
         return -1;
     }
+
+    // --- 授权验证 ---
+    std::cout << "正在进行授权验证..." << std::endl;
+    if (!verifyLicense()) {
+        std::cerr << "\n===============================================" << std::endl;
+        std::cerr << "授权验证失败！程序将退出。" << std::endl;
+        std::cerr << "请联系技术支持获取有效的授权码。" << std::endl;
+        std::cerr << "===============================================" << std::endl;
+        system("pause");
+        return -1;
+    }
+    std::cout << "授权验证通过，程序继续运行...\n" << std::endl;
 
     std::string backbone_path = argv[1];
     std::string model_path = argv[2];

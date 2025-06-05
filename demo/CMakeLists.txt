@@ -47,6 +47,7 @@ set(SOURCES
     src/image_processing.cpp
     src/tensorrt_inference.cpp
     src/person_tracker.cpp
+    src/license_auth.cpp
 )
 
 # set(CAFFE2_USE_CUDNN ON) # This line is generally for Caffe2, LibTorch handles its own cuDNN
@@ -109,6 +110,20 @@ find_package(Torch REQUIRED)
 set(OpenCV_DIR "D:/opt/opencv-4.8.0/build")
 find_package(OpenCV REQUIRED)
 
+# --- OpenSSL ---
+set(OPENSSL_ROOT_DIR "D:/Program Files/OpenSSL-Win64")
+set(OPENSSL_INCLUDE_DIR "${OPENSSL_ROOT_DIR}/include")
+if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+    set(OPENSSL_LIB_DIR "${OPENSSL_ROOT_DIR}/lib/VC/x64/MTd")
+else()
+    set(OPENSSL_LIB_DIR "${OPENSSL_ROOT_DIR}/lib/VC/x64/MT")
+endif()
+set(OPENSSL_LIBS 
+    ${OPENSSL_LIB_DIR}/libssl.lib
+    ${OPENSSL_LIB_DIR}/libcrypto.lib
+)
+
+
 if(NOT Torch_FOUND)
     message(FATAL_ERROR "LibTorch not found. Please set CMAKE_PREFIX_PATH correctly.")
 endif()
@@ -124,6 +139,7 @@ include_directories(
     ${TENSORRT_INCLUDE_DIR}
     ${CUDA_INCLUDE_DIRS}
     ${GIGELIB_INCLUDE_DIR}
+    ${OPENSSL_INCLUDE_DIR}
 )
 
 add_executable(capture_from_files src/capture_from_files.cpp ${SOURCES})
@@ -135,6 +151,7 @@ target_link_libraries(capture_from_files
     ${TENSORRT_LIBRARY_RUNTIME}
     ${CUDA_LIBRARIES}
     ${CUDA_CUDART_LIBRARY}
+    ${OPENSSL_LIBS}
 )
 
 set_property(TARGET capture_from_files PROPERTY CXX_STANDARD 17)
@@ -163,6 +180,7 @@ target_link_libraries(capture_from_cameras
     ${CUDA_LIBRARIES}
     ${CUDA_CUDART_LIBRARY}
     ${GIGELIB_LIBS}
+    ${OPENSSL_LIBS}
 )
 
 set_property(TARGET capture_from_cameras PROPERTY CXX_STANDARD 17)
@@ -181,6 +199,17 @@ if (MSVC)
   target_compile_options(capture_from_cameras PRIVATE /MP)
 endif()
 
+# 授权码生成器
+add_executable(license_generator src/license_generator.cpp)
+
+target_link_libraries(license_generator ${OPENSSL_LIBS})
+
+set_property(TARGET license_generator PROPERTY CXX_STANDARD 17)
+
+if (MSVC)
+  target_compile_options(license_generator PRIVATE /MP)
+endif()
+
 message(STATUS "Build type: ${CMAKE_BUILD_TYPE}")
 message(STATUS "C++ flags: ${CMAKE_CXX_FLAGS}")
 message(STATUS "C++ Release flags: ${CMAKE_CXX_FLAGS_RELEASE}")
@@ -188,3 +217,5 @@ message(STATUS "LibTorch libraries: ${TORCH_LIBRARIES}")
 message(STATUS "Torch include dirs: ${TORCH_INCLUDE_DIRS}")
 message(STATUS "OpenCV include dirs: ${OpenCV_INCLUDE_DIRS}")
 message(STATUS "nlohmann_json include dir: ${nlohmann_json_SOURCE_DIR}/include")
+message(STATUS "OpenSSL include dir: ${OPENSSL_INCLUDE_DIR}")
+message(STATUS "OpenSSL libraries: ${OPENSSL_LIBS}")
