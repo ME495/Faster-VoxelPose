@@ -26,7 +26,7 @@
 
 int main(int argc, const char* argv[]) {
     if (argc < 6) { // Prog_name, backbone, model, calib.json, image_base_dir, device
-        std::cerr << "用法: faster_voxelpose_demo <path_to_scripted_backbone.pt> \
+        std::cerr << "用法: capture_from_files <path_to_scripted_backbone.pt> \
                      <path_to_scripted_model.pt> <path_to_calibration.json> \
                      <image_sequence_base_dir> <device (cpu/cuda)> [num_frames_to_process]" << std::endl;
         return -1;
@@ -347,7 +347,7 @@ int main(int argc, const char* argv[]) {
             frames_processed_for_fps++;
         }
         // --- 可视化（示例：热身后每20帧保存一次）---
-        if (frame_idx >= warmup_frames && frame_idx % 1 == 0) {
+        if (frame_idx >= warmup_frames && frame_idx % 20 == 0) {
             if (fused_poses.defined() && fused_poses.numel() > 0 && 
                 fused_poses.dim() == 4 && batch_tensors.size() == NUM_CAMERAS) {
                 int num_joints_from_pose = fused_poses.size(2);

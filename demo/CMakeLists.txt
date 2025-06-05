@@ -39,7 +39,7 @@ endif()
 
 # 源文件
 set(SOURCES
-    src/main.cpp
+    src/capture_from_files.cpp
     src/types.cpp
     src/camera.cpp
     src/projection.cpp
@@ -113,9 +113,9 @@ include_directories(
     ${CUDA_INCLUDE_DIRS}
 )
 
-add_executable(faster_voxelpose_demo ${SOURCES})
+add_executable(capture_from_files ${SOURCES})
 
-target_link_libraries(faster_voxelpose_demo
+target_link_libraries(capture_from_files
     "${TORCH_LIBRARIES}"
     "${OpenCV_LIBS}"
     ${TENSORRT_LIBRARY_INFER}
@@ -124,11 +124,11 @@ target_link_libraries(faster_voxelpose_demo
     ${CUDA_CUDART_LIBRARY}
 )
 
-set_property(TARGET faster_voxelpose_demo PROPERTY CXX_STANDARD 17)
+set_property(TARGET capture_from_files PROPERTY CXX_STANDARD 17)
 
 # Apply link-time optimization to the target if supported
 if(LTO_SUPPORTED AND NOT CMAKE_BUILD_TYPE STREQUAL "Debug")
-  set_property(TARGET faster_voxelpose_demo PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
+  set_property(TARGET capture_from_files PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
 endif()
 
 if (MSVC)
@@ -137,7 +137,7 @@ if (MSVC)
   # This example does not automate DLL copying.
   
   # Enable multi-core compilation for MSVC
-  target_compile_options(faster_voxelpose_demo PRIVATE /MP)
+  target_compile_options(capture_from_files PRIVATE /MP)
 endif()
 
 message(STATUS "Build type: ${CMAKE_BUILD_TYPE}")
