@@ -96,6 +96,11 @@ int main(int argc, const char* argv[]) {
     std::vector<float> individual_space_size_cfg = {2000.0f, 2000.0f, 2000.0f};
     std::vector<int> ind_voxels_per_axis_cfg = {64, 64, 64};      
 
+    // 设置OpenMP线程数
+    int openmp_threads = min(NUM_CAMERAS, (int)std::thread::hardware_concurrency());
+    omp_set_num_threads(openmp_threads);
+    std::cout << "已设置OpenMP线程数: " << openmp_threads << std::endl;
+
     // 加载相机参数
     std::vector<CameraParams> cameras = load_cameras_from_json(calib_json_path, device);
     if (cameras.size() < NUM_CAMERAS) {
@@ -257,6 +262,7 @@ int main(int argc, const char* argv[]) {
     // 初始化性能统计变量
     long long total_duration_ms = 0;
     long long total_pose_estimation_ms = 0;
+    long long total_image_processing_ms = 0;
     int frames_processed_for_fps = 0;
     int warmup_frames = 10;
     
@@ -288,11 +294,15 @@ int main(int argc, const char* argv[]) {
                     cam[i]->CancelLastRetrievedBuffer();
             }
 
-            // 3. 处理图像并转换为tensor
-            std::vector<torch::Tensor> batch_tensors;
+            // 3. 处理图像并转换为tensor (使用OpenMP并行化)
+            auto image_processing_start_time = std::chrono::high_resolution_clock::now();
+            std::vector<torch::Tensor> batch_tensors(camNum);
+            std::vector<bool> image_valid_flags(camNum, false);
             bool all_images_valid = true;
             
-            for(int i=0; i<camNum; ++i) {
+            // OpenMP并行处理每个相机的图像
+            #pragma omp parallel for schedule(dynamic)
+            for(int i = 0; i < camNum; ++i) {
                 if(img[i].GetData() && img[i].GetDataSize()) {
                     int width = img[i].GetCols();
                     int height = img[i].GetRows();
@@ -343,32 +353,47 @@ int main(int argc, const char* argv[]) {
                             torch::kFloat32
                         ).clone().permute({2, 0, 1}).unsqueeze(0).to(device);
                         
-                        batch_tensors.push_back(img_tensor);
+                        batch_tensors[i] = img_tensor;
                         
                         // 保存原图用于可视化
                         if(cvImgs[i].empty() || cvImgs[i].size() != resized_img.size()) {
                             cvImgs[i] = Mat(temp.size(), CV_8UC3);
                         }
                         resized_img.copyTo(cvImgs[i]);
-                    } else {
-                        all_images_valid = false;
-                        break;
+                        
+                        image_valid_flags[i] = true;
                     }
-                } else {
+                }
+            }
+            
+            // 检查所有图像是否都有效
+            for(int i = 0; i < camNum; ++i) {
+                if(!image_valid_flags[i]) {
                     all_images_valid = false;
                     break;
                 }
             }
+            
+            // 如果所有图像都有效，重新组织batch_tensors为连续vector
+            std::vector<torch::Tensor> final_batch_tensors;
+            if(all_images_valid) {
+                final_batch_tensors.reserve(camNum);
+                for(int i = 0; i < camNum; ++i) {
+                    final_batch_tensors.push_back(batch_tensors[i]);
+                }
+            }
 
-            if(!all_images_valid || batch_tensors.size() != NUM_CAMERAS) {
+            if(!all_images_valid || final_batch_tensors.size() != NUM_CAMERAS) {
                 continue; // 跳过这一帧
             }
+
+            auto image_processing_end_time = std::chrono::high_resolution_clock::now();
 
             // 4. 姿态估计
             auto pose_estimation_start_time = std::chrono::high_resolution_clock::now();
             
             // Heatmap提取
-            torch::Tensor batch_input = torch::cat(batch_tensors, 0);  // [NUM_CAMERAS, 3, H, W]
+            torch::Tensor batch_input = torch::cat(final_batch_tensors, 0);  // [NUM_CAMERAS, 3, H, W]
             batch_input = batch_input.to(torch::kHalf);
             torch::Tensor batch_heatmaps = backbone_trt->forward(batch_input);
             batch_heatmaps = batch_heatmaps.to(torch::kFloat);
@@ -443,6 +468,9 @@ int main(int argc, const char* argv[]) {
             
             // 计时统计
             if (frame_idx >= warmup_frames) {
+                auto image_processing_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    image_processing_end_time - image_processing_start_time);
+                total_image_processing_ms += image_processing_duration.count();
                 auto pose_estimation_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
                     pose_estimation_end_time - pose_estimation_start_time);
                 total_pose_estimation_ms += pose_estimation_duration.count();
@@ -457,12 +485,14 @@ int main(int argc, const char* argv[]) {
             // 每100帧输出一次统计信息
             if (frame_idx % 100 == 0 && frames_processed_for_fps > 0) {
                 double avg_overall_time_per_frame_ms = static_cast<double>(total_duration_ms) / frames_processed_for_fps;
+                double avg_image_processing_ms = static_cast<double>(total_image_processing_ms) / frames_processed_for_fps;
                 double avg_pose_estimation_ms = static_cast<double>(total_pose_estimation_ms) / frames_processed_for_fps;
                 double processing_fps = 1000.0 / avg_overall_time_per_frame_ms;
                 
                 std::cout << "帧 " << frame_idx << ": 平均处理时间 " << std::fixed << std::setprecision(2) 
-                         << avg_overall_time_per_frame_ms << " ms, 姿态估计 " << avg_pose_estimation_ms 
-                         << " ms, 处理FPS: " << processing_fps << std::endl;
+                         << avg_overall_time_per_frame_ms << " ms (图像处理: " << avg_image_processing_ms 
+                         << " ms, 姿态估计: " << avg_pose_estimation_ms 
+                         << " ms), 处理FPS: " << processing_fps << std::endl;
             }
         }
     } // torch::NoGradGuard 作用域结束
@@ -470,6 +500,7 @@ int main(int argc, const char* argv[]) {
     // 输出最终统计
     if (frames_processed_for_fps > 0) {
         double avg_overall_time_per_frame_ms = static_cast<double>(total_duration_ms) / frames_processed_for_fps;
+        double avg_image_processing_ms = static_cast<double>(total_image_processing_ms) / frames_processed_for_fps;
         double avg_pose_estimation_ms = static_cast<double>(total_pose_estimation_ms) / frames_processed_for_fps;
         double processing_fps = 1000.0 / avg_overall_time_per_frame_ms;
         
@@ -477,9 +508,12 @@ int main(int argc, const char* argv[]) {
         std::cout << "最终统计 (热身后 " << frames_processed_for_fps << " 帧):" << std::endl;
         std::cout << "平均每帧处理时间: " << std::fixed << std::setprecision(2) 
                  << avg_overall_time_per_frame_ms << " 毫秒" << std::endl;
-        std::cout << "平均姿态估计时间: " << std::fixed << std::setprecision(2) 
+        std::cout << "  - 平均图像处理时间: " << std::fixed << std::setprecision(2) 
+                 << avg_image_processing_ms << " 毫秒" << std::endl;
+        std::cout << "  - 平均姿态估计时间: " << std::fixed << std::setprecision(2) 
                  << avg_pose_estimation_ms << " 毫秒" << std::endl;
         std::cout << "处理FPS: " << std::fixed << std::setprecision(2) << processing_fps << std::endl;
+        std::cout << "OpenMP线程数: " << omp_get_max_threads() << std::endl;
         std::cout << "-------------------------------------" << std::endl;
     }
 

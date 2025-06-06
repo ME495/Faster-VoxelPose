@@ -19,12 +19,19 @@ if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -O3 -DNDEBUG")
   set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "${CMAKE_CXX_FLAGS_RELWITHDEBINFO} -O2 -g -DNDEBUG")
   set(CMAKE_CXX_FLAGS_MINSIZEREL "${CMAKE_CXX_FLAGS_MINSIZEREL} -Os -DNDEBUG")
+  
+  # Enable OpenMP for GCC and Clang
+  if(OPENMP_ENABLED)
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${OpenMP_CXX_FLAGS}")
+  endif()
 elseif(MSVC)
   # For MSVC
   set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} /Od /Zi")
   set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} /O2 /Ob2 /DNDEBUG")
   set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "${CMAKE_CXX_FLAGS_RELWITHDEBINFO} /O2 /Zi /DNDEBUG")
   set(CMAKE_CXX_FLAGS_MINSIZEREL "${CMAKE_CXX_FLAGS_MINSIZEREL} /O1 /DNDEBUG")
+  
+  # Enable OpenMP for MSVC (will be handled per-target)
 endif()
 
 # Enable link-time optimization for Release builds
@@ -112,6 +119,17 @@ find_package(Torch REQUIRED)
 set(OpenCV_DIR "D:/opt/opencv-4.8.0/build")
 find_package(OpenCV REQUIRED)
 
+# --- OpenMP ---
+find_package(OpenMP COMPONENTS CXX)
+if(OpenMP_CXX_FOUND)
+    message(STATUS "Found OpenMP C++: ${OpenMP_CXX_VERSION}")
+    message(STATUS "OpenMP CXX flags: ${OpenMP_CXX_FLAGS}")
+    set(OPENMP_ENABLED TRUE)
+else()
+    message(WARNING "OpenMP C++ support not found. Building without OpenMP optimization.")
+    set(OPENMP_ENABLED FALSE)
+endif()
+
 # --- OpenSSL ---
 set(OPENSSL_ROOT_DIR "D:/Program Files/OpenSSL-Win64")
 set(OPENSSL_INCLUDE_DIR "${OPENSSL_ROOT_DIR}/include")
@@ -156,6 +174,11 @@ target_link_libraries(capture_from_files
     ${OPENSSL_LIBS}
 )
 
+# 条件性添加OpenMP支持
+if(OPENMP_ENABLED)
+    target_link_libraries(capture_from_files OpenMP::OpenMP_CXX)
+endif()
+
 set_property(TARGET capture_from_files PROPERTY CXX_STANDARD 17)
 
 # Apply link-time optimization to the target if supported
@@ -170,6 +193,11 @@ if (MSVC)
   
   # Enable multi-core compilation for MSVC
   target_compile_options(capture_from_files PRIVATE /MP)
+  
+  # Enable OpenMP for MSVC
+  if(OPENMP_ENABLED)
+    target_compile_options(capture_from_files PRIVATE /openmp)
+  endif()
 endif()
 
 add_executable(capture_from_cameras src/capture_from_cameras.cpp ${SOURCES})
@@ -185,6 +213,11 @@ target_link_libraries(capture_from_cameras
     ${OPENSSL_LIBS}
 )
 
+# 条件性添加OpenMP支持
+if(OPENMP_ENABLED)
+    target_link_libraries(capture_from_cameras OpenMP::OpenMP_CXX)
+endif()
+
 set_property(TARGET capture_from_cameras PROPERTY CXX_STANDARD 17)
 
 # Apply link-time optimization to the target if supported
@@ -199,6 +232,11 @@ if (MSVC)
   
   # Enable multi-core compilation for MSVC
   target_compile_options(capture_from_cameras PRIVATE /MP)
+  
+  # Enable OpenMP for MSVC
+  if(OPENMP_ENABLED)
+    target_compile_options(capture_from_cameras PRIVATE /openmp)
+  endif()
 endif()
 
 # 授权码生成器
@@ -218,6 +256,11 @@ message(STATUS "C++ Release flags: ${CMAKE_CXX_FLAGS_RELEASE}")
 message(STATUS "LibTorch libraries: ${TORCH_LIBRARIES}")
 message(STATUS "Torch include dirs: ${TORCH_INCLUDE_DIRS}")
 message(STATUS "OpenCV include dirs: ${OpenCV_INCLUDE_DIRS}")
+message(STATUS "OpenMP enabled: ${OPENMP_ENABLED}")
+if(OPENMP_ENABLED)
+    message(STATUS "OpenMP version: ${OpenMP_CXX_VERSION}")
+    message(STATUS "OpenMP CXX flags: ${OpenMP_CXX_FLAGS}")
+endif()
 message(STATUS "nlohmann_json include dir: ${nlohmann_json_SOURCE_DIR}/include")
 message(STATUS "OpenSSL include dir: ${OPENSSL_INCLUDE_DIR}")
 message(STATUS "OpenSSL libraries: ${OPENSSL_LIBS}")
