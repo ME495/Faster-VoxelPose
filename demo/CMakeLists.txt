@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.10)
 project(FasterVoxelPoseDemo)
 
+# set(CMAKE_BUILD_TYPE Debug)
+
 # Set default build type to Release if not specified
 if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release CACHE STRING "Choose the type of build." FORCE)

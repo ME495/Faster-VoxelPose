@@ -62,7 +62,7 @@ int main(int argc, const char* argv[]) {
     std::string model_path = argv[2];
     std::string calib_json_path = argv[3];
     std::string device_str = argv[4];
-    std::string bind_ip = (argc > 5) ? argv[5] : "192.168.1.250";
+    std::string bind_ip = (argc > 5) ? argv[5] : "192.168.2.250";
 
     // 设置设备(CPU/CUDA)
     torch::DeviceType device_type;
@@ -119,7 +119,7 @@ int main(int argc, const char* argv[]) {
         } else {
             throw std::runtime_error("backbone 文件必须是 .trt 格式");
         }
-        
+		
         model_module = torch::jit::load(model_path, device);
         model_module.eval();
     } catch (const std::exception& e) {
