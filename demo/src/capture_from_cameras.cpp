@@ -13,7 +13,86 @@
 #include <mutex>
 #include <condition_variable>
 #include <thread>
+#include <atomic>
+#include <memory>
 #include <opencv2/opencv.hpp>
+
+// 流水线数据结构
+struct FrameData {
+    int frame_id;
+    long long timestamp;
+    std::vector<cv::Mat> camera_images;
+    torch::Tensor poses;
+    std::chrono::high_resolution_clock::time_point capture_time;
+    std::chrono::high_resolution_clock::time_point processing_start_time;
+    std::chrono::high_resolution_clock::time_point processing_end_time;
+    bool valid;
+    
+    FrameData() : frame_id(-1), timestamp(0), valid(false) {}
+};
+
+// 线程安全队列
+template<typename T>
+class ThreadSafeQueue {
+private:
+    std::queue<T> queue_;
+    mutable std::mutex mutex_;
+    std::condition_variable condition_;
+    size_t max_size_;
+    std::atomic<long long> dropped_count_{0};
+    
+public:
+    ThreadSafeQueue(size_t max_size = 10) : max_size_(max_size) {}
+    
+    bool push(const T& item) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        bool dropped = false;
+        if (queue_.size() >= max_size_) {
+            // 队列满，丢弃最旧的帧
+            queue_.pop();
+            dropped_count_++;
+            dropped = true;
+        }
+        queue_.push(item);
+        condition_.notify_one();
+        return !dropped; // 返回true表示没有丢弃，false表示丢弃了旧帧
+    }
+    
+    long long get_dropped_count() const {
+        return dropped_count_.load();
+    }
+    
+    bool pop(T& item, int timeout_ms = -1) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        if (timeout_ms < 0) {
+            condition_.wait(lock, [this] { return !queue_.empty(); });
+        } else {
+            if (!condition_.wait_for(lock, std::chrono::milliseconds(timeout_ms), 
+                                   [this] { return !queue_.empty(); })) {
+                return false;
+            }
+        }
+        item = queue_.front();
+        queue_.pop();
+        return true;
+    }
+    
+    size_t size() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return queue_.size();
+    }
+    
+    bool empty() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return queue_.empty();
+    }
+    
+    void clear() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        std::queue<T> empty;
+        std::swap(queue_, empty);
+    }
+};
 
 // GigE Camera includes
 #include <stdio.h>
@@ -38,11 +117,351 @@ using namespace QUICKCAM;
 using namespace cv;
 using namespace std;
 
+// 流水线全局变量
+std::atomic<bool> pipeline_running{true};
+std::atomic<int> global_frame_id{0};
+ThreadSafeQueue<std::shared_ptr<FrameData>> capture_queue(5);
+ThreadSafeQueue<std::shared_ptr<FrameData>> processing_queue(5);
+
+// 主线程可视化所需全局变量
+std::mutex viz_mutex;
+std::condition_variable viz_cv;
+cv::Mat visualization_img_global;
+std::atomic<bool> new_frame_for_visualization{false};
+
+// 性能统计
+std::atomic<long long> total_frames_captured{0};
+std::atomic<long long> total_frames_processed{0};
+std::atomic<long long> total_frames_visualized{0};
+std::atomic<long long> total_capture_time_ms{0};
+std::atomic<long long> total_processing_time_ms{0};
+std::atomic<long long> total_visualization_time_ms{0};
+
+// 图像捕获线程函数
+void capture_thread_func(GigECamera** cam, Image* img, int camNum, 
+                        const std::vector<int>& ori_image_size_cfg,
+                        const std::vector<int>& image_size_cfg,
+                        torch::Device device, unsigned int framerate) {
+        std::cout << "图像捕获和预处理线程启动" << std::endl;
+    
+    while (pipeline_running) {
+        auto capture_start = std::chrono::high_resolution_clock::now();
+        
+        auto frame_data = std::make_shared<FrameData>();
+        frame_data->frame_id = global_frame_id++;
+        frame_data->capture_time = capture_start;
+        frame_data->camera_images.resize(camNum);
+        
+        long long timestamp = 0x7FFFFFFFFFFFFFFF;
+        bool frame_valid = true;
+        
+        // 1. 获取所有相机图像
+        for(int i = 0; i < camNum; ++i) {
+            if(cam[i]->RetrieveBuffer(&img[i]) != GEV_STATUS_SUCCESS || img[i].GetRows() == 0) {
+                frame_valid = false;
+                break;
+            }
+            
+            // 按时间戳分组帧
+            if(timestamp > img[i].GetEmbeddedTimestamp())
+                timestamp = img[i].GetEmbeddedTimestamp();
+        }
+        
+        if (!frame_valid) {
+            continue;
+        }
+        
+        // 2. 取消较新的帧
+        for(int i = 0; i < camNum; ++i) {
+            if(img[i].GetEmbeddedTimestamp() - timestamp > 1000000/framerate/2) {
+                cam[i]->CancelLastRetrievedBuffer();
+                frame_valid = false;
+            }
+        }
+        
+        if (!frame_valid) {
+            continue;
+        }
+
+        //for (int i = 0; i < camNum; ++i)
+        //{
+        //    printf("T:%fs #:%08d F:%d Res:%dx%d Format:0x%x\n",
+        //        img[i].GetEmbeddedTimestamp() / 1000000., img[i].GetEmbeddedSerial(), img[i].GetEmbeddedFramecounter(),
+        //        img[i].GetCols(), img[i].GetRows(), img[i].GetPixelFormat());
+        //}
+        
+        // 3. 复制图像数据并进行预处理
+        #pragma omp parallel for schedule(dynamic)
+        for(int i = 0; i < camNum; ++i) {
+            if(img[i].GetData() && img[i].GetDataSize()) {
+                int width = img[i].GetCols();
+                int height = img[i].GetRows();
+                
+                if(width == ori_image_size_cfg[0] && height == ori_image_size_cfg[1]) {
+                    Mat temp(height, width, CV_8UC3, img[i].GetData(), img[i].GetStride());
+                    
+                    // 图像预处理
+                    // 等比例缩放到目标尺寸，不足部分用0填充
+                    Mat resized_img = Mat::zeros(image_size_cfg[1], image_size_cfg[0], CV_8UC3);
+                    
+                    // 计算缩放比例
+                    double scale_x = static_cast<double>(image_size_cfg[0]) / temp.cols;
+                    double scale_y = static_cast<double>(image_size_cfg[1]) / temp.rows;
+                    double scale = min(scale_x, scale_y);
+                    
+                    int new_width = static_cast<int>(temp.cols * scale);
+                    int new_height = static_cast<int>(temp.rows * scale);
+                    
+                    Mat scaled_img;
+                    resize(temp, scaled_img, Size(new_width, new_height));
+                    
+                    int x_offset = (image_size_cfg[0] - new_width) / 2;
+                    int y_offset = (image_size_cfg[1] - new_height) / 2;
+                    
+                    scaled_img.copyTo(resized_img(Rect(x_offset, y_offset, new_width, new_height)));
+
+                    frame_data->camera_images[i] = resized_img.clone(); // 保留原始图像用于可视化
+                    
+                    // // 归一化并转换为tensor
+                    // Mat normalized_img;
+                    // resized_img.convertTo(normalized_img, CV_32FC3, 1.0f / 255.0f);
+                    // std::vector<cv::Mat> channels(3);
+                    // cv::split(normalized_img, channels);
+                    // const float mean[3] = {0.485f, 0.456f, 0.406f};
+                    // const float std[3] = {0.229f, 0.224f, 0.225f};
+                    // for (int c = 0; c < 3; ++c) {
+                    //     channels[c] = (channels[c] - mean[c]) / std[c];
+                    // }
+                    // cv::merge(channels, normalized_img);
+                    
+                    // torch::Tensor img_tensor = torch::from_blob(
+                    //     normalized_img.data,
+                    //     {normalized_img.rows, normalized_img.cols, 3},
+                    //     torch::kFloat32
+                    // ).clone().permute({2, 0, 1}).unsqueeze(0).to(device);
+                    
+                    // frame_data->processed_tensors[i] = img_tensor;
+                } else {
+                    frame_valid = false;
+                    break;
+                }
+            } else {
+                frame_valid = false;
+                break;
+            }
+        }
+        
+        frame_data->timestamp = timestamp;
+        frame_data->valid = frame_valid;
+        
+        if (frame_valid) {
+            capture_queue.push(frame_data);
+            auto capture_end = std::chrono::high_resolution_clock::now();
+            auto capture_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+                capture_end - capture_start).count();
+            total_capture_time_ms += capture_duration;
+            total_frames_captured++;
+        }
+        
+        // 简单的帧率控制
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    
+            std::cout << "图像捕获和预处理线程退出" << std::endl;
+}
+
+// 图像处理和姿态估计线程函数
+void processing_thread_func(std::unique_ptr<TensorRTInference>& backbone_trt,
+                           torch::jit::script::Module& model_module,
+                           const std::vector<int>& ori_image_size_cfg,
+                           const std::vector<int>& image_size_cfg,
+                           const std::vector<int>& heatmap_size_cfg,
+                           const torch::Tensor& final_sample_grid_coarse,
+                           const torch::Tensor& final_sample_grid_fine,
+                           PersonTracker& person_tracker,
+                           torch::Device device) {
+    std::cout << "姿态估计线程启动" << std::endl;
+    
+    while (pipeline_running || !capture_queue.empty()) {
+        std::shared_ptr<FrameData> frame_data;
+        if (!capture_queue.pop(frame_data, 100)) { // 100ms超时
+            continue;
+        }
+        
+        if (!frame_data || !frame_data->valid) {
+            continue;
+        }
+        
+        auto processing_start = std::chrono::high_resolution_clock::now();
+        frame_data->processing_start_time = processing_start;
+        
+        // // 使用已预处理的张量
+        // int camNum = frame_data->processed_tensors.size();
+        
+        // // 检查预处理的张量是否都有效
+        // if (camNum == 0 || frame_data->processed_tensors.empty()) {
+        //     continue;
+        // }
+
+        // 使用原始图像
+        int camNum = frame_data->camera_images.size();
+        
+        if (camNum == 0 || frame_data->camera_images.empty()) {
+            continue;
+        }
+
+        std::vector<torch::Tensor> processed_tensors;
+        processed_tensors.resize(camNum);
+
+        for (int i = 0; i < camNum; ++i) {
+            Mat resized_img = frame_data->camera_images[i];
+            processed_tensors[i] = torch::from_blob(
+                resized_img.data,
+                {resized_img.rows, resized_img.cols, 3},
+                torch::kUInt8
+            ).to(torch::kFloat).to(device).permute({ 2, 0, 1 }).unsqueeze(0);
+        }
+        torch::Tensor batch_input = torch::cat(processed_tensors, 0);
+
+        torch::NoGradGuard no_grad;
+
+        // 归一化并转换为tensor
+        batch_input = batch_input / 255.0f;
+        torch::Tensor mean = torch::tensor({ 0.485f, 0.456f, 0.406f }, device).reshape({1, 3, 1, 1});
+        torch::Tensor standard_deviation = torch::tensor({0.229f, 0.224f, 0.225f}, device).reshape({ 1, 3, 1, 1 });
+        batch_input = (batch_input - mean) / standard_deviation;
+        batch_input = batch_input.to(torch::kHalf);
+
+        // 姿态估计
+        // Heatmap提取
+        torch::Tensor batch_heatmaps = backbone_trt->forward(batch_input);
+        batch_heatmaps = batch_heatmaps.to(torch::kFloat);
+        batch_heatmaps = batch_heatmaps.unsqueeze(0);
+        
+        // 姿态估计
+        std::vector<torch::jit::IValue> model_inputs;
+        model_inputs.push_back(batch_heatmaps);
+        model_inputs.push_back(final_sample_grid_coarse);
+        model_inputs.push_back(final_sample_grid_fine);
+        torch::Tensor fused_poses = model_module.forward(model_inputs).toTensor();
+        
+        // 人体跟踪
+        if (fused_poses.defined() && fused_poses.numel() > 0) {
+            fused_poses = person_tracker.update(fused_poses, frame_data->frame_id);
+        }
+        
+        frame_data->poses = fused_poses;
+        // processed_tensors已经在捕获线程中设置
+        
+        auto processing_end = std::chrono::high_resolution_clock::now();
+        frame_data->processing_end_time = processing_end;
+        
+        if (device.type() == torch::kCUDA) {
+            torch::cuda::synchronize();
+            frame_data->processing_end_time = std::chrono::high_resolution_clock::now();
+        }
+        
+        auto processing_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+            frame_data->processing_end_time - processing_start).count();
+        total_processing_time_ms += processing_duration;
+        total_frames_processed++;
+        
+        // 发送到可视化队列
+        processing_queue.push(frame_data);
+    }
+    
+    std::cout << "姿态估计线程退出" << std::endl;
+}
+
+// 可视化线程函数
+void visualization_thread_func(const std::vector<CameraParams>& cameras,
+                              const torch::Tensor& resize_transform_tensor,
+                              const std::vector<int>& ori_image_size_cfg,
+                              bool enable_visualization) {
+    std::cout << "可视化线程启动" << std::endl;
+    
+    // FPS计算变量
+    int frames = 0;
+    double fps = 0.0;
+    double freq = getTickFrequency();
+    int64 lastTime = getTickCount();
+    
+    while (pipeline_running || !processing_queue.empty()) {
+        std::shared_ptr<FrameData> frame_data;
+        if (!processing_queue.pop(frame_data, 100)) { // 100ms超时
+            continue;
+        }
+        
+        if (!frame_data || !frame_data->valid || frame_data->camera_images.empty()) {
+            continue;
+        }
+        
+        auto visualization_start = std::chrono::high_resolution_clock::now();
+        
+        if (enable_visualization) {
+            Mat visualization_img = frame_data->camera_images[0].clone();
+            
+            if (frame_data->poses.defined() && frame_data->poses.numel() > 0 && frame_data->poses.dim() == 4) {
+                // 获取关节点定义
+                int num_joints_from_pose = frame_data->poses.size(2);
+                std::vector<std::pair<int, int>> current_limbs = get_limbs_definition(num_joints_from_pose);
+                
+                // 3D姿态可视化
+                visualize_3d_pose(
+                    visualization_img,
+                    frame_data->poses,
+                    cameras[0],
+                    resize_transform_tensor,
+                    current_limbs,
+                    ori_image_size_cfg
+                );
+            }
+            
+            // 添加FPS和统计信息
+            frames++;
+            if (frames % 10 == 0) {
+                int64 now = getTickCount();
+                double seconds = (now - lastTime) / freq;
+                fps = 10.0 / seconds;
+                lastTime = now;
+            }
+            
+            std::string fps_text = "FPS: " + std::to_string((int)fps);
+            std::string frame_text = "Frame: " + std::to_string(frame_data->frame_id);
+            std::string queue_text = "Queue: C" + std::to_string(capture_queue.size()) + 
+                                   " P" + std::to_string(processing_queue.size());
+            
+            putText(visualization_img, fps_text, Point(10, 30), FONT_HERSHEY_SIMPLEX, 1, Scalar(0, 255, 255), 2);
+            putText(visualization_img, frame_text, Point(10, 70), FONT_HERSHEY_SIMPLEX, 1, Scalar(0, 255, 255), 2);
+            putText(visualization_img, queue_text, Point(10, 110), FONT_HERSHEY_SIMPLEX, 1, Scalar(0, 255, 255), 2);
+            
+            // 将图像发送到主线程进行显示
+            {
+                std::lock_guard<std::mutex> lock(viz_mutex);
+                visualization_img_global = visualization_img;
+                new_frame_for_visualization = true;
+            }
+            viz_cv.notify_one();
+        }
+        
+        auto visualization_end = std::chrono::high_resolution_clock::now();
+        auto visualization_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+            visualization_end - visualization_start).count();
+        total_visualization_time_ms += visualization_duration;
+        total_frames_visualized++;
+    }
+    
+    std::cout << "可视化线程退出" << std::endl;
+}
+
 int main(int argc, const char* argv[]) {
     if (argc < 5) {
         std::cerr << "用法: capture_from_cameras <path_to_scripted_backbone.pt> "
                      "<path_to_scripted_model.pt> <path_to_calibration.json> "
-                     "<device (cpu/cuda)> [bind_ip_address]" << std::endl;
+                     "<device (cpu/cuda)> [bind_ip_address] [enable_visualization]" << std::endl;
+        std::cerr << "参数说明:" << std::endl;
+        std::cerr << "  bind_ip_address: 可选，默认为 192.168.2.250" << std::endl;
+        std::cerr << "  enable_visualization: 可选，0=关闭可视化(默认)，1=开启可视化" << std::endl;
         return -1;
     }
 
@@ -63,6 +482,11 @@ int main(int argc, const char* argv[]) {
     std::string calib_json_path = argv[3];
     std::string device_str = argv[4];
     std::string bind_ip = (argc > 5) ? argv[5] : "192.168.2.250";
+    bool enable_visualization = false;  // 默认关闭可视化
+    if (argc > 6) {
+        int viz_flag = std::atoi(argv[6]);
+        enable_visualization = (viz_flag != 0);
+    }
 
     // 设置设备(CPU/CUDA)
     torch::DeviceType device_type;
@@ -74,6 +498,9 @@ int main(int argc, const char* argv[]) {
         std::cout << "使用CPU设备." << std::endl;
     }
     torch::Device device(device_type);
+    
+    // 显示可视化设置
+    std::cout << "可视化设置: " << (enable_visualization ? "开启" : "关闭") << std::endl;
 
     // 设置torch线程数
     int num_threads = std::thread::hardware_concurrency();
@@ -179,8 +606,6 @@ int main(int argc, const char* argv[]) {
     BusManager busMgr;
     Property ppt;
     Image img[10];
-    vector<Mat> cvImgs(10);
-    Mat imgConcat;
 
     unsigned int camNum = 0, R3Num = 0;
     
@@ -244,278 +669,193 @@ int main(int argc, const char* argv[]) {
         goto camera_cleanup;
     }
 
-    camNum = R3Num;
+        camNum = R3Num;
     
-    // 创建OpenCV窗口
-    namedWindow("Pose Estimation Results", WINDOW_NORMAL);
-    resizeWindow("Pose Estimation Results", 1024, 768);
+    // 根据设置决定是否创建OpenCV窗口
+    if (enable_visualization) {
+        namedWindow("Pose Estimation Results", WINDOW_NORMAL);
+        resizeWindow("Pose Estimation Results", 1024, 784);
+        std::cout << "已创建可视化窗口" << std::endl;
+    }
     
-    printf("开始捕获和处理图像，按 Q 键退出\n");
+    std::cout << "==================================================" << std::endl;
+    std::cout << "启动流水线并行处理系统" << std::endl;
+    std::cout << "图像捕获&预处理 -> 姿态估计 -> 可视化 (并行)" << std::endl;
+    if (enable_visualization) {
+        std::cout << "可视化模式: 启用，在窗口中按 Q/ESC 键退出" << std::endl;
+    } else {
+        std::cout << "可视化模式: 禁用，按 Q 键退出" << std::endl;
+    }
+    std::cout << "队列大小: 捕获=" << capture_queue.size() 
+              << ", 处理=" << processing_queue.size() << std::endl;
+    std::cout << "==================================================" << std::endl;
     
-    // 初始化FPS计算变量
-    int frames = 0;
-    double fps = 0.0;
-    double freq = getTickFrequency();
-    int64 lastTime = getTickCount();
-    int frame_idx = 0;
-    
-    // 初始化性能统计变量
-    long long total_duration_ms = 0;
-    long long total_pose_estimation_ms = 0;
-    long long total_image_processing_ms = 0;
-    int frames_processed_for_fps = 0;
-    int warmup_frames = 10;
-    
-    // --- 主处理循环 ---
+    // --- 流水线处理作用域 (避免goto跳过变量初始化) ---
     {
-        torch::NoGradGuard no_grad;
-
-        while(1) {
-            if(_kbhit() && _getch() == 'q')
-                break;
-
-            auto overall_frame_start_time = std::chrono::high_resolution_clock::now();
+        // --- 启动流水线线程 ---
+        pipeline_running = true;
+        
+        // 启动图像捕获线程
+        std::thread capture_thread(capture_thread_func, cam, img, camNum, 
+                                  std::ref(ori_image_size_cfg), std::ref(image_size_cfg), device, framerate);
+        
+        // 启动姿态估计线程
+        std::thread processing_thread(processing_thread_func, 
+                                     std::ref(backbone_trt), std::ref(model_module),
+                                     std::ref(ori_image_size_cfg), std::ref(image_size_cfg), std::ref(heatmap_size_cfg),
+                                     std::ref(final_sample_grid_coarse), std::ref(final_sample_grid_fine),
+                                     std::ref(person_tracker), device);
+        
+        // 启动可视化线程
+        std::thread visualization_thread(visualization_thread_func,
+                                       std::ref(cameras), std::ref(resize_transform_tensor),
+                                       std::ref(ori_image_size_cfg), enable_visualization);
+        
+        // 监控线程 - 定期输出统计信息
+        std::thread monitor_thread([&]() {
+            std::cout << "监控线程启动" << std::endl;
+            int last_captured = 0, last_processed = 0, last_visualized = 0;
+            auto last_time = std::chrono::high_resolution_clock::now();
             
-            long long timestamp = 0x7FFFFFFFFFFFFFFF;
-
-            // 1. 获取所有相机图像
-            for(int i=0; i<camNum; ++i) {
-                if(cam[i]->RetrieveBuffer(&img[i])!= GEV_STATUS_SUCCESS)
-                    continue;
+            while (pipeline_running) {
+                std::this_thread::sleep_for(std::chrono::seconds(5));
                 
-                // 按时间戳分组帧
-                if(timestamp > img[i].GetEmbeddedTimestamp())
-                    timestamp = img[i].GetEmbeddedTimestamp();
-            }
-
-            // 2. 取消较新的帧
-            for(int i=0; i<camNum; ++i) {
-                if(img[i].GetEmbeddedTimestamp() - timestamp > 1000000/framerate/2)
-                    cam[i]->CancelLastRetrievedBuffer();
-            }
-
-            // 3. 处理图像并转换为tensor (使用OpenMP并行化)
-            auto image_processing_start_time = std::chrono::high_resolution_clock::now();
-            std::vector<torch::Tensor> batch_tensors(camNum);
-            std::vector<bool> image_valid_flags(camNum, false);
-            bool all_images_valid = true;
-            
-            // OpenMP并行处理每个相机的图像
-            #pragma omp parallel for schedule(dynamic)
-            for(int i = 0; i < camNum; ++i) {
-                if(img[i].GetData() && img[i].GetDataSize()) {
-                    int width = img[i].GetCols();
-                    int height = img[i].GetRows();
+                auto current_time = std::chrono::high_resolution_clock::now();
+                int current_captured = total_frames_captured.load();
+                int current_processed = total_frames_processed.load();
+                int current_visualized = total_frames_visualized.load();
+                
+                auto duration = std::chrono::duration_cast<std::chrono::seconds>(current_time - last_time).count();
+                if (duration > 0) {
+                    double capture_fps = (current_captured - last_captured) / static_cast<double>(duration);
+                    double processing_fps = (current_processed - last_processed) / static_cast<double>(duration);
+                    double visualization_fps = (current_visualized - last_visualized) / static_cast<double>(duration);
                     
-                    if(width == ori_image_size_cfg[0] && height == ori_image_size_cfg[1]) {
-                        // 创建OpenCV Mat
-                        Mat temp(height, width, CV_8UC3, img[i].GetData(), img[i].GetStride());
+                                    std::cout << "=== 流水线状态统计 ===" << std::endl;
+                std::cout << "捕获FPS: " << std::fixed << std::setprecision(1) << capture_fps 
+                         << " | 处理FPS: " << processing_fps 
+                         << " | 可视化FPS: " << visualization_fps << std::endl;
+                std::cout << "队列状态: 捕获=" << capture_queue.size() 
+                         << ", 处理=" << processing_queue.size() << std::endl;
+                std::cout << "总帧数: 捕获=" << current_captured 
+                         << ", 处理=" << current_processed 
+                         << ", 可视化=" << current_visualized << std::endl;
+                std::cout << "丢弃帧数: 捕获队列=" << capture_queue.get_dropped_count() 
+                         << ", 处理队列=" << processing_queue.get_dropped_count() << std::endl;
+                    
+                    if (current_processed > 0) {
+                        double avg_capture_ms = static_cast<double>(total_capture_time_ms.load()) / current_captured;
+                        double avg_processing_ms = static_cast<double>(total_processing_time_ms.load()) / current_processed;
+                                                double avg_visualization_ms = static_cast<double>(total_visualization_time_ms.load()) / 
+                                                       max(1LL, static_cast<long long>(current_visualized));
                         
-                        // 等比例缩放到目标尺寸，不足部分用0填充
-                        Mat resized_img = Mat::zeros(image_size_cfg[1], image_size_cfg[0], CV_8UC3);
-                        
-                        // 计算缩放比例，取较小的比例以确保图像完全在目标尺寸内
-                        double scale_x = static_cast<double>(image_size_cfg[0]) / width;
-                        double scale_y = static_cast<double>(image_size_cfg[1]) / height;
-                        double scale = min(scale_x, scale_y);
-                        
-                        // 计算缩放后的尺寸
-                        int new_width = static_cast<int>(width * scale);
-                        int new_height = static_cast<int>(height * scale);
-                        
-                        // 缩放图像
-                        Mat scaled_img;
-                        resize(temp, scaled_img, Size(new_width, new_height));
-                        
-                        // 计算在目标图像中的位置（居中）
-                        int x_offset = (image_size_cfg[0] - new_width) / 2;
-                        int y_offset = (image_size_cfg[1] - new_height) / 2;
-                        
-                        // 将缩放后的图像复制到目标图像的中央
-                        scaled_img.copyTo(resized_img(Rect(x_offset, y_offset, new_width, new_height)));
-                        
-                        // 归一化并转换为tensor
-                        Mat normalized_img;
-                        // 使用ImageNet标准归一化：先归一化到[0,1]，再减均值除以标准差
-                        resized_img.convertTo(normalized_img, CV_32FC3, 1.0f / 255.0f);
-                        std::vector<cv::Mat> channels(3);
-                        cv::split(normalized_img, channels);
-                        const float mean[3] = {0.485f, 0.456f, 0.406f};
-                        const float std[3] = {0.229f, 0.224f, 0.225f};
-                        for (int c = 0; c < 3; ++c) {
-                            channels[c] = (channels[c] - mean[c]) / std[c];
-                        }
-                        cv::merge(channels, normalized_img);
-                        
-                        torch::Tensor img_tensor = torch::from_blob(
-                            normalized_img.data,
-                            {normalized_img.rows, normalized_img.cols, 3},
-                            torch::kFloat32
-                        ).clone().permute({2, 0, 1}).unsqueeze(0).to(device);
-                        
-                        batch_tensors[i] = img_tensor;
-                        
-                        // 保存原图用于可视化
-                        if(cvImgs[i].empty() || cvImgs[i].size() != resized_img.size()) {
-                            cvImgs[i] = Mat(temp.size(), CV_8UC3);
-                        }
-                        resized_img.copyTo(cvImgs[i]);
-                        
-                        image_valid_flags[i] = true;
+                        std::cout << "平均耗时: 捕获=" << std::fixed << std::setprecision(2) << avg_capture_ms 
+                                 << "ms, 处理=" << avg_processing_ms 
+                                 << "ms, 可视化=" << avg_visualization_ms << "ms" << std::endl;
+                    }
+                    std::cout << "=========================" << std::endl;
+                    
+                    last_captured = current_captured;
+                    last_processed = current_processed;
+                    last_visualized = current_visualized;
+                    last_time = current_time;
+                }
+            }
+            std::cout << "监控线程退出" << std::endl;
+        });
+        
+        // 主线程等待退出信号或处理可视化
+        if (enable_visualization) {
+            cv::Mat local_viz_img; // 用于在主线程中显示
+            while (pipeline_running) {
+                {
+                    std::unique_lock<std::mutex> lock(viz_mutex);
+                    if (viz_cv.wait_for(lock, std::chrono::milliseconds(100), [&]{ return new_frame_for_visualization.load(); })) {
+                        local_viz_img = visualization_img_global.clone();
+                        new_frame_for_visualization = false;
                     }
                 }
-            }
-            
-            // 检查所有图像是否都有效
-            for(int i = 0; i < camNum; ++i) {
-                if(!image_valid_flags[i]) {
-                    all_images_valid = false;
-                    break;
+
+                if (!local_viz_img.empty()) {
+                    imshow("Pose Estimation Results", local_viz_img);
+                }
+
+                int key = waitKey(1);
+                if (key == 'q' || key == 'Q' || key == 27) {
+                    pipeline_running = false;
                 }
             }
-            
-            // 如果所有图像都有效，重新组织batch_tensors为连续vector
-            std::vector<torch::Tensor> final_batch_tensors;
-            if(all_images_valid) {
-                final_batch_tensors.reserve(camNum);
-                for(int i = 0; i < camNum; ++i) {
-                    final_batch_tensors.push_back(batch_tensors[i]);
+        } else {
+            std::cout << "流水线运行中，按 Q 键退出..." << std::endl;
+            while (pipeline_running) {
+                if (_kbhit() && _getch() == 'q') {
+                    pipeline_running = false;
                 }
-            }
-
-            if(!all_images_valid || final_batch_tensors.size() != NUM_CAMERAS) {
-                continue; // 跳过这一帧
-            }
-
-            auto image_processing_end_time = std::chrono::high_resolution_clock::now();
-
-            // 4. 姿态估计
-            auto pose_estimation_start_time = std::chrono::high_resolution_clock::now();
-            
-            // Heatmap提取
-            torch::Tensor batch_input = torch::cat(final_batch_tensors, 0);  // [NUM_CAMERAS, 3, H, W]
-            batch_input = batch_input.to(torch::kHalf);
-            torch::Tensor batch_heatmaps = backbone_trt->forward(batch_input);
-            batch_heatmaps = batch_heatmaps.to(torch::kFloat);
-            batch_heatmaps = batch_heatmaps.unsqueeze(0);
-
-            // 姿态估计
-            std::vector<torch::jit::IValue> model_inputs;
-            model_inputs.push_back(batch_heatmaps);
-            model_inputs.push_back(final_sample_grid_coarse); 
-            model_inputs.push_back(final_sample_grid_fine);
-            torch::Tensor fused_poses = model_module.forward(model_inputs).toTensor();
-            
-            // 人体跟踪
-            if (fused_poses.defined() && fused_poses.numel() > 0) {
-                fused_poses = person_tracker.update(fused_poses, frame_idx);
-            }
-            
-            auto pose_estimation_end_time = std::chrono::high_resolution_clock::now();
-            if (device_type == torch::kCUDA) {
-                torch::cuda::synchronize(); 
-                pose_estimation_end_time = std::chrono::high_resolution_clock::now();
-            }
-
-            // 5. 可视化
-            Mat visualization_img;
-            if (fused_poses.defined() && fused_poses.numel() > 0 && fused_poses.dim() == 4) {
-                // 选择第一个相机视角进行可视化
-                visualization_img = cvImgs[0];
-                
-                // 获取关节点定义
-                int num_joints_from_pose = fused_poses.size(2);
-                std::vector<std::pair<int, int>> current_limbs = get_limbs_definition(num_joints_from_pose);
-                
-                // 使用visualization.cpp中的函数进行3D姿态可视化
-                visualize_3d_pose(
-                    visualization_img,
-                    fused_poses,
-                    cameras[0],  // 使用第一个相机的参数
-                    resize_transform_tensor,
-                    current_limbs,
-                    ori_image_size_cfg
-                );
-            } else {
-                // 没有检测到姿态时显示原图
-                visualization_img = cvImgs[0];
-            }
-
-            // 添加FPS信息
-            frames++;
-            if (frames % 10 == 0) {
-                int64 now = getTickCount();
-                double seconds = (now - lastTime) / freq;
-                fps = 10.0 / seconds;
-                lastTime = now;
-            }
-            
-            // 在图像上显示FPS和跟踪信息
-            std::string fps_text = "FPS: " + std::to_string((int)fps);
-            std::string person_text = "Persons: " + std::to_string(person_tracker.get_tracked_person_count());
-            putText(visualization_img, fps_text, Point(10, 30), FONT_HERSHEY_SIMPLEX, 1, Scalar(0, 255, 255), 2);
-            putText(visualization_img, person_text, Point(10, 70), FONT_HERSHEY_SIMPLEX, 1, Scalar(0, 255, 255), 2);
-            
-            // 显示结果
-            imshow("Pose Estimation Results", visualization_img);
-            
-            // 检查按键
-            int key = waitKey(1);
-            if(key == 'q' || key == 'Q' || key == 27) // q, Q or ESC to exit
-                break;
-
-            auto overall_frame_end_time = std::chrono::high_resolution_clock::now();
-            
-            // 计时统计
-            if (frame_idx >= warmup_frames) {
-                auto image_processing_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
-                    image_processing_end_time - image_processing_start_time);
-                total_image_processing_ms += image_processing_duration.count();
-                auto pose_estimation_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
-                    pose_estimation_end_time - pose_estimation_start_time);
-                total_pose_estimation_ms += pose_estimation_duration.count();
-                auto overall_frame_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
-                    overall_frame_end_time - overall_frame_start_time);
-                total_duration_ms += overall_frame_duration.count();
-                frames_processed_for_fps++;
-            }
-            
-            frame_idx++;
-            
-            // 每100帧输出一次统计信息
-            if (frame_idx % 100 == 0 && frames_processed_for_fps > 0) {
-                double avg_overall_time_per_frame_ms = static_cast<double>(total_duration_ms) / frames_processed_for_fps;
-                double avg_image_processing_ms = static_cast<double>(total_image_processing_ms) / frames_processed_for_fps;
-                double avg_pose_estimation_ms = static_cast<double>(total_pose_estimation_ms) / frames_processed_for_fps;
-                double processing_fps = 1000.0 / avg_overall_time_per_frame_ms;
-                
-                std::cout << "帧 " << frame_idx << ": 平均处理时间 " << std::fixed << std::setprecision(2) 
-                         << avg_overall_time_per_frame_ms << " ms (图像处理: " << avg_image_processing_ms 
-                         << " ms, 姿态估计: " << avg_pose_estimation_ms 
-                         << " ms), 处理FPS: " << processing_fps << std::endl;
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
             }
         }
-    } // torch::NoGradGuard 作用域结束
-
-    // 输出最终统计
-    if (frames_processed_for_fps > 0) {
-        double avg_overall_time_per_frame_ms = static_cast<double>(total_duration_ms) / frames_processed_for_fps;
-        double avg_image_processing_ms = static_cast<double>(total_image_processing_ms) / frames_processed_for_fps;
-        double avg_pose_estimation_ms = static_cast<double>(total_pose_estimation_ms) / frames_processed_for_fps;
-        double processing_fps = 1000.0 / avg_overall_time_per_frame_ms;
         
-        std::cout << "-------------------------------------" << std::endl;
-        std::cout << "最终统计 (热身后 " << frames_processed_for_fps << " 帧):" << std::endl;
-        std::cout << "平均每帧处理时间: " << std::fixed << std::setprecision(2) 
-                 << avg_overall_time_per_frame_ms << " 毫秒" << std::endl;
-        std::cout << "  - 平均图像处理时间: " << std::fixed << std::setprecision(2) 
-                 << avg_image_processing_ms << " 毫秒" << std::endl;
-        std::cout << "  - 平均姿态估计时间: " << std::fixed << std::setprecision(2) 
-                 << avg_pose_estimation_ms << " 毫秒" << std::endl;
-        std::cout << "处理FPS: " << std::fixed << std::setprecision(2) << processing_fps << std::endl;
+        // 等待所有线程完成
+        std::cout << "正在停止流水线..." << std::endl;
+        
+        if (capture_thread.joinable()) {
+            capture_thread.join();
+        }
+        if (processing_thread.joinable()) {
+            processing_thread.join();
+        }
+        if (visualization_thread.joinable()) {
+            visualization_thread.join();
+        }
+        if (monitor_thread.joinable()) {
+            monitor_thread.join();
+        }
+        
+        // 输出最终统计
+        std::cout << "\n==================== 流水线最终统计 ====================" << std::endl;
+        
+        long long final_captured = total_frames_captured.load();
+        long long final_processed = total_frames_processed.load();
+        long long final_visualized = total_frames_visualized.load();
+        
+        std::cout << "总处理帧数:" << std::endl;
+        std::cout << "  - 图像捕获: " << final_captured << " 帧" << std::endl;
+        std::cout << "  - 姿态估计: " << final_processed << " 帧" << std::endl;
+        std::cout << "  - 可视化显示: " << final_visualized << " 帧" << std::endl;
+        
+        std::cout << "丢弃帧统计:" << std::endl;
+        std::cout << "  - 捕获队列丢弃: " << capture_queue.get_dropped_count() << " 帧" << std::endl;
+        std::cout << "  - 处理队列丢弃: " << processing_queue.get_dropped_count() << " 帧" << std::endl;
+        
+        if (final_captured > 0) {
+            double avg_capture_ms = static_cast<double>(total_capture_time_ms.load()) / final_captured;
+            std::cout << "平均图像捕获时间: " << std::fixed << std::setprecision(2) 
+                     << avg_capture_ms << " 毫秒/帧" << std::endl;
+        }
+        
+        if (final_processed > 0) {
+            double avg_processing_ms = static_cast<double>(total_processing_time_ms.load()) / final_processed;
+            std::cout << "平均姿态估计时间: " << std::fixed << std::setprecision(2) 
+                     << avg_processing_ms << " 毫秒/帧" << std::endl;
+        }
+        
+        if (final_visualized > 0) {
+            double avg_visualization_ms = static_cast<double>(total_visualization_time_ms.load()) / final_visualized;
+            std::cout << "平均可视化时间: " << std::fixed << std::setprecision(2) 
+                     << avg_visualization_ms << " 毫秒/帧" << std::endl;
+        }
+        
+        // 计算流水线效率
+        double capture_efficiency = final_captured > 0 ? (static_cast<double>(final_processed) / final_captured * 100.0) : 0.0;
+        double visualization_efficiency = final_processed > 0 ? (static_cast<double>(final_visualized) / final_processed * 100.0) : 0.0;
+        
+        std::cout << "流水线效率:" << std::endl;
+        std::cout << "  - 处理效率: " << std::fixed << std::setprecision(1) << capture_efficiency << "%" << std::endl;
+        std::cout << "  - 可视化效率: " << std::fixed << std::setprecision(1) << visualization_efficiency << "%" << std::endl;
+        
         std::cout << "OpenMP线程数: " << omp_get_max_threads() << std::endl;
-        std::cout << "-------------------------------------" << std::endl;
-    }
+        std::cout << "========================================================" << std::endl;
+    } // 流水线处理作用域结束
 
 camera_cleanup:
     // 清理相机资源
@@ -531,9 +871,9 @@ camera_cleanup:
     }
     
     // 释放OpenCV资源
-    cvImgs.clear();
-    imgConcat.release();
-    destroyAllWindows();
+    if (enable_visualization) {
+        destroyAllWindows();
+    }
     
     std::cout << "程序结束." << std::endl;
     
